@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+ui/dist/
+output/
+streamlit_output/
+projects/*
+!projects/.gitkeep
+demo/chroma_data/

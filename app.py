@@ -110,6 +110,8 @@ def state_defaults() -> None:
         "pipeline_text_chunks": [],
         "pipeline_text_qa": [],
         "pipeline_text_chunking": None,
+        "pipeline_selected_object_ids": [],
+        "pipeline_object_selection_generation": 0,
         "projects": [],
         "selected_project_id": "",
         "project_settings": {},
@@ -387,6 +389,11 @@ def render_pdf_workbench(client: ApiClient) -> None:
             st.session_state.pipeline_raw_objects = raw_objects
             st.session_state.pipeline_objects = objects
             st.session_state.pipeline_qa = {}
+            st.session_state.pipeline_selected_object_ids = []
+            st.session_state.pipeline_object_selection_generation += 1
+            st.session_state.filtered_object_ids = [
+                item["object_id"] for item in objects
+            ]
             st.session_state.pipeline_text_documents = text_documents
             st.session_state.pipeline_text_chunks = []
             st.session_state.pipeline_text_qa = []
@@ -485,28 +492,76 @@ def render_pdf_workbench(client: ApiClient) -> None:
     filtered_ids = st.session_state.get("filtered_object_ids", [item["object_id"] for item in objects])
     objects_by_id = {item["object_id"]: item for item in objects}
     visible_objects = [objects_by_id[item_id] for item_id in filtered_ids if item_id in objects_by_id]
+    selected_object_ids = set(
+        st.session_state.get("pipeline_selected_object_ids", [])
+    )
     object_rows = []
     for item in visible_objects:
         characteristics = item.get("characteristics", {})
         object_rows.append({
+            "Select": item["object_id"] in selected_object_ids,
+            "_object_id": item["object_id"],
             "Object": item.get("object_no"), "PDF": item.get("doc_name"),
             "Page(s)": ", ".join(map(str, item.get("pages") or [item.get("page_no")])),
             "Type": item.get("object_type"), "Caption": item.get("docling_title"),
             "Summary": characteristics.get("content_summary") or characteristics.get("description"),
             "Confidence": characteristics.get("confidence"),
         })
-    st.dataframe(object_rows, width="stretch", hide_index=True)
-
-    labels = {
-        item["object_id"]: f"{item.get('doc_name')} · p.{item.get('page_no')} · {item.get('object_no')} · {item.get('object_type')}"
-        for item in visible_objects
-    }
-    selected_ids = st.multiselect(
-        "Objects for Q&A generation",
-        list(labels),
-        format_func=lambda value: labels.get(value, value),
-        key="selected_pdf_objects",
+    if object_rows:
+        visible_object_ids = {row["_object_id"] for row in object_rows}
+        selection_signature = hashlib.sha1(
+            "\0".join(row["_object_id"] for row in object_rows).encode("utf-8")
+        ).hexdigest()[:12]
+        edited_object_rows = st.data_editor(
+            object_rows,
+            width="stretch",
+            hide_index=True,
+            num_rows="fixed",
+            key=(
+                f"pdf_object_selection_"
+                f"{st.session_state.pipeline_object_selection_generation}_"
+                f"{selection_signature}"
+            ),
+            column_config={
+                "Select": st.column_config.CheckboxColumn(
+                    "Select for Q&A",
+                    help="Check the objects to include in object Q&A generation.",
+                    default=False,
+                ),
+                "_object_id": None,
+            },
+            disabled=[
+                column
+                for column in object_rows[0]
+                if column not in {"Select"}
+            ],
+        )
+        selected_visible_ids = {
+            row["_object_id"]
+            for row in edited_object_rows
+            if row.get("Select")
+        }
+        selected_object_ids.difference_update(visible_object_ids)
+        selected_object_ids.update(selected_visible_ids)
+        st.session_state.pipeline_selected_object_ids = list(selected_object_ids)
+    else:
+        st.info("No objects are currently shown to select.")
+    selected_ids = [
+        item["object_id"]
+        for item in objects
+        if item["object_id"] in selected_object_ids
+    ]
+    st.caption(
+        f"{len(selected_ids)} object(s) selected. Check **Select for Q&A** "
+        "in the objects table to change the selection."
     )
+    labels = {
+        item["object_id"]: (
+            f"{item.get('doc_name')} · p.{item.get('page_no')} · "
+            f"{item.get('object_no')} · {item.get('object_type')}"
+        )
+        for item in objects
+    }
     st.markdown("#### Generate Q&A")
     st.caption(
         "Object actions use the selected objects. Text actions use all extracted prose chunks."
@@ -2068,7 +2123,8 @@ def render_visual_check(client: ApiClient) -> None:
     st.subheader("Visual Check")
     st.caption(
         f"UMAP projects vectors from project `{project_id}` into 2D. "
-        "HDBSCAN groups nearby vectors; points labeled -1 are noise."
+        "HDBSCAN groups nearby points in the displayed 2D projection; "
+        "points labeled -1 are noise."
     )
     if st.session_state.get("visual_check_sample_size") == 2000:
         st.session_state["visual_check_sample_size"] = 300
@@ -2165,38 +2221,6 @@ def render_visual_check(client: ApiClient) -> None:
         st.info("Select at least one cluster to display its vectors.")
         return
 
-    qa_upload = st.file_uploader(
-        "PDF Workbench Q&A workbook",
-        type=["xlsx"],
-        key="visual_check_qa_workbook",
-        help=(
-            "Upload the Excel workbook downloaded from PDF Workbench. "
-            "Selecting a text or table point shows its matching questions "
-            "and expected answers."
-        ),
-    )
-    qa_rows: list[dict[str, Any]] = []
-    qa_workbook_error = None
-    if qa_upload is not None:
-        workbook_bytes = qa_upload.getvalue()
-        workbook_signature = hashlib.sha256(workbook_bytes).hexdigest()
-        if st.session_state.get("visual_check_qa_signature") != workbook_signature:
-            try:
-                qa_rows = load_workbench_qa_workbook(workbook_bytes)
-                st.session_state["visual_check_qa_rows"] = qa_rows
-                st.session_state["visual_check_qa_signature"] = workbook_signature
-                st.session_state.pop("visual_check_qa_error", None)
-            except (ValueError, OSError, RuntimeError) as exc:
-                st.session_state["visual_check_qa_rows"] = []
-                st.session_state["visual_check_qa_signature"] = workbook_signature
-                st.session_state["visual_check_qa_error"] = str(exc)
-        qa_rows = st.session_state.get("visual_check_qa_rows", [])
-        qa_workbook_error = st.session_state.get("visual_check_qa_error")
-    else:
-        st.session_state.pop("visual_check_qa_signature", None)
-        st.session_state.pop("visual_check_qa_rows", None)
-        st.session_state.pop("visual_check_qa_error", None)
-
     figure = px.scatter(
         visible_frame,
         x="x",
@@ -2233,6 +2257,125 @@ def render_visual_check(client: ApiClient) -> None:
         on_select="rerun",
         selection_mode="points",
     )
+    cluster_color_by_label = {
+        str(trace.name): trace.marker.color
+        for trace in figure.data
+        if trace.name is not None
+    }
+
+    qa_upload = st.file_uploader(
+        "PDF Workbench Q&A workbook",
+        type=["xlsx"],
+        key="visual_check_qa_workbook",
+        help=(
+            "Upload the Excel workbook downloaded from PDF Workbench. "
+            "Matching questions and answers are shown with their chunk's "
+            "UMAP cluster and color."
+        ),
+    )
+    qa_rows: list[dict[str, Any]] = []
+    qa_workbook_error = None
+    if qa_upload is not None:
+        workbook_bytes = qa_upload.getvalue()
+        workbook_signature = hashlib.sha256(workbook_bytes).hexdigest()
+        if st.session_state.get("visual_check_qa_signature") != workbook_signature:
+            try:
+                qa_rows = load_workbench_qa_workbook(workbook_bytes)
+                st.session_state["visual_check_qa_rows"] = qa_rows
+                st.session_state["visual_check_qa_signature"] = workbook_signature
+                st.session_state.pop("visual_check_qa_error", None)
+            except (ValueError, OSError, RuntimeError) as exc:
+                st.session_state["visual_check_qa_rows"] = []
+                st.session_state["visual_check_qa_signature"] = workbook_signature
+                st.session_state["visual_check_qa_error"] = str(exc)
+        qa_rows = st.session_state.get("visual_check_qa_rows", [])
+        qa_workbook_error = st.session_state.get("visual_check_qa_error")
+    else:
+        st.session_state.pop("visual_check_qa_signature", None)
+        st.session_state.pop("visual_check_qa_rows", None)
+        st.session_state.pop("visual_check_qa_error", None)
+        st.session_state.pop("visual_check_qa_match_signature", None)
+        st.session_state.pop("visual_check_qa_matches", None)
+
+    if qa_upload is not None and not qa_workbook_error:
+        qa_match_signature = hashlib.sha256(
+            "\0".join(
+                [
+                    project_id,
+                    str(generation),
+                    workbook_signature,
+                    *visible_ids,
+                ]
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            st.session_state.get("visual_check_qa_match_signature")
+            != qa_match_signature
+        ):
+            with st.spinner("Matching workbook Q&A to visible UMAP chunks…"):
+                linked_points = [
+                    (str(point["id"]), match_chunk_qa(point, qa_rows))
+                    for point in visible_points
+                ]
+            st.session_state["visual_check_qa_matches"] = [
+                (point_id, matches)
+                for point_id, matches in linked_points
+                if matches
+            ]
+            st.session_state["visual_check_qa_match_signature"] = (
+                qa_match_signature
+            )
+        linked_points = [
+            (visible_point_by_id[point_id], matches)
+            for point_id, matches in st.session_state.get(
+                "visual_check_qa_matches", []
+            )
+            if point_id in visible_point_by_id
+        ]
+        st.markdown("#### Q&A linked to UMAP chunks")
+        if linked_points:
+            st.caption(
+                f"Found Q&A for {len(linked_points)} of {len(visible_points)} "
+                "visible chunks. Each card uses its point's cluster color."
+            )
+            for point, matching_rows in linked_points:
+                cluster = point["cluster"]
+                cluster_label = (
+                    "Noise (-1)" if cluster == -1 else f"Cluster {cluster}"
+                )
+                color = cluster_color_by_label.get(
+                    str(cluster_label),
+                    "#808080",
+                )
+                with st.container(border=True):
+                    st.markdown(
+                        f'<span style="display:inline-block;width:12px;height:12px;'
+                        f'border-radius:50%;background:{color};margin-right:6px">'
+                        f'</span><strong>{cluster_label}</strong>',
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(f"Chunk ID: {point['id']}")
+                    st.text(str(point.get("text") or "No document text stored."))
+                    st.dataframe(
+                        [
+                            {
+                                "Category": row.get("category") or "",
+                                "Question": row["question"],
+                                "Answer": row["expected_answer"],
+                            }
+                            for row in matching_rows
+                        ],
+                        width="stretch",
+                        hide_index=True,
+                    )
+        else:
+            st.info(
+                "No workbook Q&A matched the visible chunks. Confirm the "
+                "workbook and selected project contain the same PDF content."
+            )
+    elif qa_workbook_error:
+        st.error(f"Could not read the Q&A workbook: {qa_workbook_error}")
+
     selected_ids = _selected_visual_record_ids(
         selection.selection.points,
         figure,

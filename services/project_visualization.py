@@ -110,7 +110,7 @@ def build_project_visualization(
         min_samples=1,
         metric="euclidean",
         copy=True,
-    ).fit_predict(vector_matrix)
+    ).fit_predict(coordinates)
 
     points = [
         {
@@ -133,6 +133,7 @@ def build_project_visualization(
         "skipped_records": skipped_records,
         "projection": "UMAP",
         "clustering": "HDBSCAN",
+        "clustering_space": "umap_2d",
         "min_cluster_size": max(2, effective_min_cluster_size),
         "points": points,
     }

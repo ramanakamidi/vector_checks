@@ -3,9 +3,12 @@ import TopBar from '../components/TopBar';
 import Sidebar from '../components/Sidebar';
 import { useProject } from '../contexts/ProjectContext';
 import { FolderOpen } from 'lucide-react';
+import { useLocation } from 'react-router-dom';
 
 export default function AppLayout() {
   const { activeProject, loading } = useProject();
+  const { pathname } = useLocation();
+  const projectOptional = pathname === '/pdf-workbench';
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col">
@@ -17,7 +20,7 @@ export default function AppLayout() {
             <div className="flex items-center justify-center h-full">
               <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-cognizant-blue" />
             </div>
-          ) : !activeProject ? (
+          ) : !activeProject && !projectOptional ? (
             <div className="flex flex-col items-center justify-center h-full text-slate-400">
               <FolderOpen size={48} className="mb-4" />
               <p className="text-lg font-medium">No Project Selected</p>
@@ -26,7 +29,7 @@ export default function AppLayout() {
               </p>
             </div>
           ) : (
-            <div className="p-6 max-w-6xl mx-auto">
+            <div className="workspace-content">
               <Outlet />
             </div>
           )}

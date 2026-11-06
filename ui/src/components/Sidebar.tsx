@@ -1,12 +1,15 @@
 import { useLocation, useNavigate } from 'react-router-dom';
-import { Settings, Upload, Layers, Play } from 'lucide-react';
+import { Settings, Upload, Layers, Play, FileSearch, FileCheck2, Eye } from 'lucide-react';
 import { useProject } from '../contexts/ProjectContext';
 
 const NAV_ITEMS = [
-  { path: '/settings', label: 'Settings', icon: Settings, stage: 1 },
+  { path: '/settings', label: 'Project setup', icon: Settings, stage: 1 },
   { path: '/ingestion', label: 'Ingestion', icon: Upload, stage: 2 },
   { path: '/generation', label: 'Data Generation', icon: Layers, stage: 3 },
-  { path: '/execution', label: 'Execute', icon: Play, stage: 4 },
+  { path: '/execution', label: 'Execution', icon: Play, stage: 4 },
+  { path: '/pdf-workbench', label: 'PDF Workbench', icon: FileSearch, stage: 5 },
+  { path: '/answer-improvement', label: 'Answer Improvement', icon: FileCheck2, stage: 6 },
+  { path: '/visual-check', label: 'Visual Check', icon: Eye, stage: 7 },
 ] as const;
 
 export default function Sidebar() {
@@ -18,25 +21,27 @@ export default function Sidebar() {
     <aside className="w-60 bg-white border-r border-slate-200 flex flex-col">
       {/* Stage navigation */}
       <nav className="flex-1 py-4">
-        <p className="px-4 mb-3 text-xs font-semibold text-slate-400 uppercase tracking-wider">
-          Workflow Stages
+        <p className="px-5 mb-3 text-[10px] font-bold text-slate-400 uppercase tracking-[0.16em]">
+          Workflows
         </p>
         {NAV_ITEMS.map((item) => {
           const isActive = location.pathname === item.path;
           const Icon = item.icon;
-          const disabled = !activeProject;
+          const disabled = !activeProject && item.path !== '/pdf-workbench';
 
           return (
             <button
               key={item.path}
               onClick={() => !disabled && navigate(item.path)}
               disabled={disabled}
-              className={`w-full flex items-center gap-3 px-4 py-3 text-sm transition-colors ${
+              aria-label={item.label}
+              title={item.label}
+              className={`w-full flex items-center gap-3 px-4 py-2.5 text-sm transition-colors ${
                 isActive
-                  ? 'bg-blue-50 text-cognizant-blue border-r-2 border-cognizant-blue font-medium'
+                  ? 'bg-indigo-50 text-cognizant-blue border-r-[3px] border-cognizant-blue font-semibold'
                   : disabled
                     ? 'text-slate-300 cursor-not-allowed'
-                    : 'text-slate-600 hover:bg-slate-50 hover:text-slate-800'
+                    : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
               }`}
             >
               <span

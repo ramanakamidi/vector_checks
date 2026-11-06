@@ -5,11 +5,11 @@ export default {
     extend: {
       colors: {
         cognizant: {
-          blue: '#0033A1',
-          'blue-dark': '#002878',
-          'blue-light': '#1a5cc8',
-          accent: '#00bfff',
-          navy: '#1a1a2e',
+          blue: '#3730A3',
+          'blue-dark': '#211D66',
+          'blue-light': '#4F46E5',
+          accent: '#38BDF8',
+          navy: '#151B3D',
         },
       },
       fontFamily: {

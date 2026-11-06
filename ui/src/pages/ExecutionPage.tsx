@@ -39,6 +39,7 @@ import {
   getMockAutStatus,
 } from '../api/client';
 import LoadingSpinner from '../components/shared/LoadingSpinner';
+import ExecutionPerformanceCharts from '../components/ExecutionPerformanceCharts';
 
 export default function ExecutionPage() {
   const { activeProject } = useProject();
@@ -569,6 +570,8 @@ export default function ExecutionPage() {
               colorClass="text-slate-600"
             />
           </div>
+
+          <ExecutionPerformanceCharts execution={viewingExecution} />
 
           {/* Download Report Button */}
           <div className="flex justify-end">

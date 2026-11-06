@@ -16,10 +16,9 @@ This framework covers two market-tool equivalents:
 ## Project Structure
 
 ```
-app.py                    — Streamlit dashboard entry point
+app.py                    — legacy Streamlit dashboard entry point
 server.py                 — FastAPI backend entry point
 mock_aut.py               — Mock AUT entry point
-streamlit_launcher.py     — Windows-compatible Streamlit launcher
 
 clients/
   api_client.py           — typed dashboard API client
@@ -40,6 +39,7 @@ services/
   report_generator.py     — execution report generation
   workbook_evaluation.py  — AUT answer and judge workbook workflow
   answer_improvement.py  — Chroma-grounded expected-answer workbook review
+  react_workbench.py     — session-backed PDF Workbench and answer-review API logic
   paths.py                — shared project-data paths
 
 connectors/
@@ -68,6 +68,40 @@ manual_chroma_check.py    — read-only inspection and question retrieval for pr
 Generated project data stays under `projects/`; the standalone React UI remains
 under `ui/`. Keep these runtime/data directories separate from application
 source when cleaning or reorganizing the repository.
+
+## Run the React dashboard
+
+The React/Vite dashboard is the primary UI. Start the API and frontend in two
+PowerShell terminals from the project root:
+
+```powershell
+# Terminal 1 — Python API
+py -m venv venv
+.\venv\Scripts\Activate.ps1
+python -m pip install -r streamlit_requirements.txt
+uvicorn server:app --host 127.0.0.1 --port 8000
+
+# Terminal 2 — React/Vite UI
+Set-Location .\ui
+npm install
+npm run dev
+```
+
+Open the Vite URL printed in the second terminal (normally
+`http://localhost:5173`). Vite proxies `/api` requests to the local FastAPI
+server. Project setup, ingestion, dataset generation, execution, PDF
+Workbench, answer improvement, and Visual Check use the existing project
+services. Azure OpenAI credentials entered in the PDF Workbench or Answer
+Improvement remain in browser memory and are sent only with the requested
+operation. PDF Workbench session state is held by the API process, so restarting
+the API expires the active workbench session.
+
+Build the frontend for a production bundle with:
+
+```powershell
+Set-Location .\ui
+npm run build
+```
 
 ## What's Covered (Five Categories)
 
@@ -149,9 +183,9 @@ questions within a PDF prefer the existing object-generated row. Internal
 source metadata is stored in hidden workbook columns for chunk linking while
 keeping the normal spreadsheet view focused on the Q&A.
 
-## Review Expected Answers in Streamlit
+## Review Expected Answers
 
-The **Answer Improvement** tab beside **Execution** accepts the generated Q&A
+The React **Answer Improvement** page accepts the generated Q&A
 `.xlsx` workbook. PDF Workbench includes each Q&A row's object type and
 workspace-relative cropped image paths in the workbook. Graph and image rows
 are reviewed using their crop(s) only; their text is not retrieved from Chroma.
@@ -175,22 +209,23 @@ other rows can still finish.
 
 ## Visualize Project Vectors
 
-The **Visual Check** tab reads a bounded sample of the selected project's
+The React **Visual Check** page reads a bounded sample of the selected project's
 persistent Chroma collection, projects its vectors to 2D with UMAP, and labels
-clusters with HDBSCAN. Use **Show clusters** to filter the map, then select a
-point or use **Selected vector** to inspect chunk text and metadata; the record
-selector stays constrained to visible clusters. The default sample is 300
+clusters with HDBSCAN on those same 2D coordinates, so cluster colors reflect
+the displayed map. Use the cluster filter to constrain the map and Q&A cards,
+then select a point to inspect chunk text and metadata. The default sample is 300
 records, and the default minimum cluster size is 2; both values are
 configurable. Records without valid,
 consistently sized finite vectors are skipped. Install `streamlit_requirements.txt` to include UMAP and Plotly; the
 HDBSCAN implementation is provided by scikit-learn. Install the app dependencies
 with `pip install -r streamlit_requirements.txt`.
-Upload a PDF Workbench Q&A workbook in this tab to show the matching questions
-and expected answers when selecting a UMAP point. Text Q&A is matched against
-the selected chunk's source text; table Q&A is matched by PDF and page, with
-table content used to disambiguate multiple tables on the same page. Only text
-and table rows are shown. The workbook keeps the linking fields hidden, so
-download a fresh workbook after updating the app to enable text matching.
+Upload a PDF Workbench Q&A workbook below the map to show matching questions
+and expected answers on cards tagged with the same cluster label and color.
+Text Q&A is matched against the selected chunk's source text; table Q&A is
+matched by PDF and page, with table content used to disambiguate multiple
+tables on the same page. Only text and table rows are shown. The workbook keeps
+the linking fields hidden, so download a fresh workbook after updating the app
+to enable text matching.
 
 ## Calibrate Similarity with Negative Queries
 

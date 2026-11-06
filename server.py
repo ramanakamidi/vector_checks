@@ -9,6 +9,7 @@ the React frontend.  Start with::
 """
 
 import os
+import base64
 
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
@@ -28,16 +29,17 @@ import socket
 import urllib.error
 import urllib.request
 from dataclasses import asdict
+from pathlib import Path
 
 # Ensure the project root is importable regardless of cwd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fastapi import FastAPI, HTTPException, Query, Body, UploadFile, File
+from fastapi import FastAPI, HTTPException, Query, Body, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, SecretStr
 from starlette.concurrency import run_in_threadpool
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from connectors.base import VectorDBConnector, VectorRecord
 from connectors.chroma_connector import ChromaConnector
@@ -49,6 +51,7 @@ from services.pdf_ingestion import ingest_pdf
 from services.project_vector_checks import CHECK_CATEGORIES, run_project_checks
 from services.project_visualization import build_project_visualization
 from services.project_chroma import open_project_collection
+from services import react_workbench
 
 # ── App setup ─────────────────────────────────────────────────────────
 
@@ -114,6 +117,26 @@ class SearchRequest(BaseModel):
     field: str
     value: Any
     limit: int = 50
+
+
+class WorkbenchQARequest(BaseModel):
+    object_ids: List[str] = Field(default_factory=list)
+    generate_objects: bool = True
+    generate_text: bool = True
+    object_question_count: int = Field(default=5, ge=1, le=20)
+    text_question_count: int = Field(default=2, ge=1, le=3)
+    api_key: SecretStr
+    endpoint: str
+    deployment: str
+    api_version: str
+
+
+class WorkbenchChunkingRequest(BaseModel):
+    technique: Literal["heading_aware", "recursive", "sentence", "token", "semantic"]
+    chunk_size: int = Field(default=512, ge=64, le=12000)
+    overlap: int = Field(default=0, ge=0, le=4096)
+    min_sentences_per_chunk: int = Field(default=1, ge=1, le=20)
+    semantic_threshold: float = Field(default=0.8, ge=0.05, le=0.95)
 
 
 class AutoPairsRequest(BaseModel):
@@ -1382,6 +1405,235 @@ async def get_project_visualization_data(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/visualization-data/with-qa")
+async def get_project_visualization_with_qa(
+    project_id: str,
+    file: UploadFile = File(...),
+    sample_size: int = Form(300, ge=3, le=10000),
+    min_cluster_size: int = Form(2, ge=2, le=100),
+):
+    """Return the project UMAP points with matching PDF Workbench Q&A rows."""
+    from services.visual_qa import load_workbench_qa_workbook, match_chunk_qa
+
+    try:
+        workbook_bytes = await file.read()
+        qa_rows = load_workbench_qa_workbook(workbook_bytes)
+        result = await run_in_threadpool(
+            build_project_visualization,
+            project_id,
+            sample_size,
+            min_cluster_size,
+        )
+        for point in result.get("points", []):
+            point["qa"] = match_chunk_qa(point, qa_rows)
+        result["qa_matched_points"] = sum(
+            bool(point.get("qa")) for point in result.get("points", [])
+        )
+        result["qa_rows_loaded"] = len(qa_rows)
+        return result
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        await file.close()
+
+
+@app.post("/api/workbench/analyze")
+async def analyze_workbench_pdfs(
+    files: List[UploadFile] = File(...),
+    mode: str = Form("crop"),
+    technique: str = Form("heading_aware"),
+    chunk_size: int = Form(2600),
+    overlap: int = Form(250),
+    min_sentences_per_chunk: int = Form(1),
+    semantic_threshold: float = Form(0.8),
+    api_key: str = Form(...),
+    endpoint: str = Form(...),
+    deployment: str = Form(...),
+    api_version: str = Form(...),
+):
+    """Analyze PDFs and keep the interactive workbench data for this API process."""
+    uploads = []
+    try:
+        for uploaded in files:
+            uploads.append((
+                os.path.basename(uploaded.filename or "upload.pdf"),
+                await uploaded.read(),
+            ))
+        chunking = WorkbenchChunkingRequest(
+            technique=technique,
+            chunk_size=chunk_size,
+            overlap=overlap,
+            min_sentences_per_chunk=min_sentences_per_chunk,
+            semantic_threshold=semantic_threshold,
+        ).model_dump()
+        credentials = {
+            "api_key": api_key,
+            "endpoint": endpoint,
+            "deployment": deployment,
+            "api_version": api_version,
+        }
+        return await run_in_threadpool(
+            react_workbench.analyze_pdfs,
+            uploads,
+            mode,
+            chunking,
+            credentials,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"PDF analysis or text chunking failed: {exc}",
+        ) from exc
+    finally:
+        for uploaded in files:
+            await uploaded.close()
+
+
+@app.get("/api/workbench/{session_id}")
+async def get_workbench_session(session_id: str):
+    try:
+        return react_workbench.get_session(session_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.put("/api/workbench/{session_id}/chunking")
+async def update_workbench_chunking(
+    session_id: str,
+    req: WorkbenchChunkingRequest,
+):
+    try:
+        return await run_in_threadpool(
+            react_workbench.update_chunking,
+            session_id,
+            req.model_dump(),
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/workbench/{session_id}/qa")
+async def generate_workbench_qa(
+    session_id: str,
+    req: WorkbenchQARequest,
+):
+    credentials = {
+        "api_key": req.api_key.get_secret_value(),
+        "endpoint": req.endpoint,
+        "deployment": req.deployment,
+        "api_version": req.api_version,
+    }
+    try:
+        return await run_in_threadpool(
+            react_workbench.generate_qa,
+            session_id,
+            req.object_ids,
+            req.generate_objects,
+            req.generate_text,
+            req.object_question_count,
+            req.text_question_count,
+            credentials,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Q&A generation failed: {exc}") from exc
+
+
+@app.get("/api/workbench/{session_id}/workbook")
+async def download_workbench_workbook(session_id: str):
+    try:
+        workbook = await run_in_threadpool(
+            react_workbench.build_workbook, session_id
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {
+        "filename": "object_qa_validation.xlsx",
+        "content_base64": base64.b64encode(workbook).decode("ascii"),
+    }
+
+
+@app.get("/api/workbench/{session_id}/objects/{object_id}/image")
+async def get_workbench_object_image(
+    session_id: str,
+    object_id: str,
+    part: int = Query(default=0, ge=0),
+):
+    try:
+        image_path = react_workbench.get_object_image(
+            session_id, object_id, part
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(image_path, media_type="image/png")
+
+
+@app.post("/api/answer-improvement/review")
+async def review_expected_answers(
+    file: UploadFile = File(...),
+    project_id: str = Form(...),
+    top_k: int = Form(2, ge=1, le=8),
+    api_key: str = Form(...),
+    endpoint: str = Form(...),
+    deployment: str = Form(...),
+    api_version: str = Form(...),
+):
+    filename = os.path.basename(file.filename or "answers.xlsx")
+    if not filename.casefold().endswith(".xlsx"):
+        await file.close()
+        raise HTTPException(status_code=422, detail="Upload a valid .xlsx workbook.")
+    try:
+        workbook_bytes = await file.read()
+        credentials = {
+            "api_key": api_key,
+            "endpoint": endpoint,
+            "deployment": deployment,
+            "api_version": api_version,
+        }
+        reviewed, summary = await run_in_threadpool(
+            react_workbench.review_workbook,
+            workbook_bytes,
+            project_id,
+            top_k,
+            credentials,
+        )
+        return {
+            "filename": f"{Path(filename).stem}_answer_reviewed.xlsx",
+            "content_base64": base64.b64encode(reviewed).decode("ascii"),
+            "summary": summary,
+        }
+    except (ValueError, RuntimeError, FileNotFoundError, OSError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Answer review failed: {exc}") from exc
+    finally:
+        await file.close()
 
 
 @app.post("/api/projects/{project_id}/ingest-pdfs")

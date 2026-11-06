@@ -123,13 +123,26 @@ The **PDF Workbench** provides three Q&A actions: **Generate Q&A for objects**,
 **Generate Q&A for objects and text**, and **Generate Q&A for text only**.
 Object actions use the selected analyzed tables, charts, or images and their
 crops; text actions use all prose chunks extracted from Docling Markdown during
-the same PDF conversion. Text chunks follow document headings, exclude
-Markdown tables and images, and are bounded to keep each Azure OpenAI request
-focused. Chunking preserves nested heading paths, paragraphs, and list items;
-long passages split at sentence boundaries, with sentence-level overlap where
-it fits the configured maximum size. Text Q&A categories describe the question
-intent (specific fact, definition, comparison, process step, or cause and
-effect) rather than generic text retrieval. Choose 1–3 questions per text
+the same PDF conversion. Before analysis, choose a text chunking technique:
+**Heading-aware** (the existing behavior), **Recursive**, **Sentence**,
+**Token**, or **Semantic**. Recursive, Sentence, and Token use the project's
+`all-MiniLM-L6-v2` tokenizer. Semantic uses Chonkie's tokenizer for its
+`minishlab/potion-base-32M` model, which is downloaded on first use. Settings
+vary by technique: chunk size, overlap where supported, minimum sentences for
+SentenceChunker, and similarity threshold for SemanticChunker.
+SentenceChunker's sentence setting is a minimum, with chunk size as the upper
+bound.
+
+Text chunks follow document headings and exclude Markdown tables and images.
+Heading-aware mode preserves nested heading paths, paragraphs, and list items;
+Chonkie modes process each heading section independently and retain its path as
+chunk context. Chunks are assigned the page number from Docling's page-specific
+Markdown export. Text Q&A workbook rows use `object_type` = `text` and record
+the selected technique in `analysis_mode`. After extraction, apply a different
+technique to the stored Markdown without re-analyzing the PDFs. The preview
+shows sample chunks before you generate Q&A. Text Q&A categories describe the
+question intent (specific fact, definition, comparison, process step, or cause
+and effect) rather than generic text retrieval. Choose 1–3 questions per text
 chunk. Text questions and object questions appear together in the generated
 workbook and are both included when sending Q&A to a project; duplicate
 questions within a PDF prefer the existing object-generated row. Internal

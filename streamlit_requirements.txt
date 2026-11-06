@@ -11,3 +11,4 @@ plotly>=5.24
 matplotlib>=3.8
 scikit-learn>=1.3
 umap-learn>=0.5.7
+chonkie[semantic]>=1.7,<2

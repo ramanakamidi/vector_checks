@@ -106,8 +106,10 @@ def state_defaults() -> None:
         "pipeline_objects": [],
         "pipeline_raw_objects": [],
         "pipeline_qa": {},
+        "pipeline_text_documents": [],
         "pipeline_text_chunks": [],
         "pipeline_text_qa": [],
+        "pipeline_text_chunking": None,
         "projects": [],
         "selected_project_id": "",
         "project_settings": {},
@@ -203,6 +205,148 @@ def render_pdf_workbench(client: ApiClient) -> None:
         help="Neighboring-page mode checks table continuation and merges confirmed table parts.",
     )
     mode = {"Object crop": "crop", "Crop + full page": "page", "Crop + neighboring pages": "page_context"}[mode_label]
+    st.markdown("#### Text chunking")
+    chunking_label = st.selectbox(
+        "Technique",
+        [
+            "Heading-aware (current)",
+            "Recursive",
+            "Sentence",
+            "Token",
+            "Semantic",
+        ],
+        key="pdf_text_chunking_technique",
+        help="Choose how prose extracted from the PDFs is divided before text Q&A generation.",
+    )
+    chunking_technique = {
+        "Heading-aware (current)": "heading_aware",
+        "Recursive": "recursive",
+        "Sentence": "sentence",
+        "Token": "token",
+        "Semantic": "semantic",
+    }[chunking_label]
+    if chunking_technique == "heading_aware":
+        chunk_size = st.number_input(
+            "Maximum chunk size (characters)",
+            min_value=128,
+            max_value=12000,
+            value=2600,
+            step=100,
+            key="pdf_text_chunk_size_heading",
+        )
+        overlap = st.number_input(
+            "Character overlap",
+            min_value=0,
+            max_value=int(chunk_size) - 1,
+            value=min(250, int(chunk_size) - 1),
+            step=25,
+            key="pdf_text_overlap_heading",
+        )
+    else:
+        chunk_size = st.number_input(
+            "Maximum chunk body size (tokens)",
+            min_value=64,
+            max_value=4096,
+            value=512,
+            step=32,
+            key=f"pdf_text_chunk_size_{chunking_technique}",
+        )
+        overlap = 0
+        if chunking_technique in {"sentence", "token"}:
+            overlap = st.number_input(
+                "Token overlap",
+                min_value=0,
+                max_value=int(chunk_size) - 1,
+                value=min(50, int(chunk_size) - 1),
+                step=5,
+                key=f"pdf_text_overlap_{chunking_technique}",
+            )
+    min_sentences_per_chunk = 1
+    semantic_threshold = 0.8
+    if chunking_technique == "sentence":
+        min_sentences_per_chunk = st.number_input(
+            "Minimum sentences per chunk",
+            min_value=1,
+            max_value=20,
+            value=1,
+            key="pdf_text_min_sentences",
+            help="SentenceChunker treats this as a minimum, while the token size remains the upper bound.",
+        )
+    elif chunking_technique == "semantic":
+        semantic_threshold = st.slider(
+            "Semantic similarity threshold",
+            min_value=0.05,
+            max_value=0.95,
+            value=0.8,
+            step=0.05,
+            help="Lower values group more sentences together; the first semantic run downloads Chonkie's default embedding model.",
+        )
+    chunking_options = {
+        "technique": chunking_technique,
+        "chunk_size": int(chunk_size),
+        "overlap": int(overlap),
+        "min_sentences_per_chunk": int(min_sentences_per_chunk),
+        "semantic_threshold": float(semantic_threshold),
+    }
+    if chunking_technique != "heading_aware":
+        if chunking_technique == "semantic":
+            st.caption(
+                "Semantic chunking uses Chonkie's minishlab/potion-base-32M "
+                "embedding model and its tokenizer. Section headings are added "
+                "as context after chunking and are not included in the token limit."
+            )
+        else:
+            st.caption(
+                "Chonkie measures tokens with this project's "
+                "all-MiniLM-L6-v2 tokenizer. Section headings are added as "
+                "context after chunking and are not included in the token limit."
+            )
+
+    def make_text_chunks(
+        documents: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        chunks: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        for document in documents:
+            if document.get("error"):
+                errors.append({
+                    "PDF": str(document.get("pdf_name", "")),
+                    "Error": str(document["error"]),
+                })
+                continue
+            page_markdowns = document.get("page_markdowns") or []
+            if page_markdowns:
+                for page in page_markdowns:
+                    page_no = int(page["page_no"])
+                    page_chunks = custom_logic.chunk_document_text(
+                        page.get("markdown", ""),
+                        document["pdf_name"],
+                        f"{document['document_id']}:page-{page_no}",
+                        chunk_size=chunking_options["chunk_size"],
+                        overlap=chunking_options["overlap"],
+                        technique=chunking_options["technique"],
+                        min_sentences_per_chunk=chunking_options["min_sentences_per_chunk"],
+                        semantic_threshold=chunking_options["semantic_threshold"],
+                    )
+                    for chunk in page_chunks:
+                        chunk["page_no"] = page_no
+                        chunk["pages"] = [page_no]
+                    chunks.extend(page_chunks)
+            else:
+                chunks.extend(
+                    custom_logic.chunk_document_text(
+                        document.get("markdown", ""),
+                        document["pdf_name"],
+                        document["document_id"],
+                        chunk_size=chunking_options["chunk_size"],
+                        overlap=chunking_options["overlap"],
+                        technique=chunking_options["technique"],
+                        min_sentences_per_chunk=chunking_options["min_sentences_per_chunk"],
+                        semantic_threshold=chunking_options["semantic_threshold"],
+                    )
+                )
+        return chunks, errors
+
     run_col, info_col = st.columns([1, 3])
     with run_col:
         run_analysis = st.button("Analyze PDFs", type="primary", disabled=not uploads, width="stretch")
@@ -240,35 +384,51 @@ def render_pdf_workbench(client: ApiClient) -> None:
                     update_progress,
                     text_documents=text_documents,
                 )
-            text_chunks = []
-            text_errors = []
-            for document in text_documents:
-                if document.get("error"):
-                    text_errors.append({
-                        "PDF": document.get("pdf_name"),
-                        "Error": document["error"],
-                    })
-                    continue
-                text_chunks.extend(
-                    custom_logic.chunk_document_text(
-                        document.get("markdown", ""),
-                        document["pdf_name"],
-                        document["document_id"],
-                    )
-                )
             st.session_state.pipeline_raw_objects = raw_objects
             st.session_state.pipeline_objects = objects
             st.session_state.pipeline_qa = {}
-            st.session_state.pipeline_text_chunks = text_chunks
+            st.session_state.pipeline_text_documents = text_documents
+            st.session_state.pipeline_text_chunks = []
             st.session_state.pipeline_text_qa = []
-            st.session_state.pipeline_text_errors = text_errors
+            st.session_state.pipeline_text_errors = []
             st.session_state.pipeline_output_dir = str(session_dir)
+            text_chunks, text_errors = make_text_chunks(text_documents)
+            st.session_state.pipeline_text_chunks = text_chunks
+            st.session_state.pipeline_text_errors = text_errors
+            st.session_state.pipeline_text_chunking = chunking_options.copy()
             st.success(
                 f"Analysis complete: {len(objects)} useful object(s) and "
                 f"{len(text_chunks)} prose chunk(s) from {len(uploads)} PDF(s)."
             )
         except Exception as exc:
-            st.error(f"PDF analysis failed: {exc}")
+            st.error(f"PDF analysis or text chunking failed: {exc}")
+
+    extracted_documents = st.session_state.get("pipeline_text_documents", [])
+    chunking_settings_pending = False
+    if extracted_documents:
+        prior_chunking = st.session_state.get("pipeline_text_chunking")
+        chunking_settings_pending = prior_chunking != chunking_options
+        if st.button(
+            "Apply chunking settings to extracted text",
+            disabled=not any(not item.get("error") for item in extracted_documents),
+            width="stretch",
+        ):
+            try:
+                with st.spinner("Re-chunking extracted PDF text…"):
+                    text_chunks, text_errors = make_text_chunks(extracted_documents)
+                st.session_state.pipeline_text_chunks = text_chunks
+                st.session_state.pipeline_text_qa = []
+                st.session_state.pipeline_text_errors = text_errors
+                st.session_state.pipeline_text_chunking = chunking_options.copy()
+                chunking_settings_pending = False
+                st.success(f"Created {len(text_chunks)} text chunk(s).")
+            except Exception as exc:
+                st.error(f"Could not apply text chunking settings: {exc}")
+        if chunking_settings_pending:
+            st.info(
+                "Chunking settings changed. Apply them to the extracted text "
+                "below; the PDFs will not need to be analyzed again."
+            )
 
     objects = st.session_state.pipeline_objects
     text_chunks = st.session_state.get("pipeline_text_chunks", [])
@@ -282,6 +442,19 @@ def render_pdf_workbench(client: ApiClient) -> None:
     if not objects and not text_chunks:
         st.info("Upload one or more PDFs and run analysis to populate this workspace.")
         return
+
+    if text_chunks:
+        with st.expander("Text chunk preview", expanded=False):
+            st.caption(
+                f"Showing up to 3 of {len(text_chunks)} chunks. "
+                "Changing the technique clears generated text Q&A when applied."
+            )
+            for index, chunk in enumerate(text_chunks[:3], start=1):
+                section = chunk.get("section") or "No heading"
+                st.caption(
+                    f"{index}. {chunk.get('pdf_name', '')} · {section}"
+                )
+                st.text(str(chunk.get("source_text", ""))[:2000])
 
     st.divider()
     table_col, chart_col, image_col, text_col = st.columns(4)
@@ -360,15 +533,23 @@ def render_pdf_workbench(client: ApiClient) -> None:
     )
     generate_combined_clicked = combined_button.button(
         "Generate Q&A for objects and text",
-        disabled=not selected_ids or not text_chunks,
+        disabled=not selected_ids or not text_chunks or chunking_settings_pending,
         width="stretch",
-        help="Generates Q&A for the selected objects and all extracted prose chunks.",
+        help=(
+            "Apply changed text chunking settings first."
+            if chunking_settings_pending
+            else "Generates Q&A for the selected objects and all extracted prose chunks."
+        ),
     )
     generate_text_clicked = text_button.button(
         "Generate Q&A for text only",
-        disabled=not text_chunks,
+        disabled=not text_chunks or chunking_settings_pending,
         width="stretch",
-        help="Generates questions from prose chunks; tables and figures are not included.",
+        help=(
+            "Apply changed text chunking settings first."
+            if chunking_settings_pending
+            else "Generates questions from prose chunks; tables and figures are not included."
+        ),
     )
     generate_objects = generate_objects_clicked or generate_combined_clicked
     generate_text = generate_text_clicked or generate_combined_clicked

@@ -20,6 +20,7 @@ import json
 import re
 import time
 from collections import defaultdict
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -245,10 +246,18 @@ def extract_objects_from_pdf(
             markdown = doc.export_to_markdown()
             if not isinstance(markdown, str):
                 raise TypeError("Docling Markdown export did not return text.")
+            page_markdowns = [
+                {
+                    "page_no": int(page_no),
+                    "markdown": doc.export_to_markdown(page_no=page_no),
+                }
+                for page_no in sorted(doc.pages)
+            ]
             text_documents.append({
                 "document_id": f"doc-{doc_idx + 1}",
                 "pdf_name": doc_name,
                 "markdown": markdown,
+                "page_markdowns": page_markdowns,
             })
         except Exception as exc:
             text_documents.append({
@@ -1799,16 +1808,42 @@ def generate_qa_for_object(image_path, num_qa: int, object_type: str='table', de
         print(f"  Warning: only {len(parsed['pairs'])} pair(s) recovered (requested {num_qa}).")
     return parsed
 
+@lru_cache(maxsize=1)
+def _get_chonkie_semantic_embedding_model() -> Any:
+    from chonkie.embeddings import AutoEmbeddings
+
+    return AutoEmbeddings.get_embeddings("minishlab/potion-base-32M")
+
+
 def chunk_document_text(
     markdown: str,
     document_name: str,
     document_id: str,
     chunk_size: int = 2600,
     overlap: int = 250,
+    technique: str = "heading_aware",
+    min_sentences_per_chunk: int = 1,
+    semantic_threshold: float = 0.8,
 ) -> list[dict[str, Any]]:
-    """Split Docling Markdown into structure- and sentence-aware prose chunks."""
-    if chunk_size < 1 or overlap < 0 or overlap >= chunk_size:
-        raise ValueError("Text chunking requires chunk_size > overlap >= 0.")
+    """Split Docling Markdown into prose chunks using the selected strategy."""
+    supported_techniques = {
+        "heading_aware",
+        "recursive",
+        "sentence",
+        "token",
+        "semantic",
+    }
+    if technique not in supported_techniques:
+        raise ValueError(f"Unsupported text chunking technique: {technique}.")
+    if chunk_size < 1:
+        raise ValueError("Text chunk size must be greater than zero.")
+    if technique in {"heading_aware", "sentence", "token"}:
+        if overlap < 0 or overlap >= chunk_size:
+            raise ValueError("Text chunking requires chunk_size > overlap >= 0.")
+    if min_sentences_per_chunk < 1:
+        raise ValueError("Minimum sentences per chunk must be at least one.")
+    if not 0 < semantic_threshold < 1:
+        raise ValueError("Semantic similarity threshold must be between 0 and 1, exclusive.")
     markdown = re.sub(
         r"<table\b.*?</table>",
         "\n\n",
@@ -1875,18 +1910,84 @@ def chunk_document_text(
             current_lines.append(stripped)
     flush_section()
 
+    if technique != "heading_aware":
+        try:
+            from chonkie import RecursiveChunker, SentenceChunker, SemanticChunker, TokenChunker
+        except ImportError as exc:
+            raise RuntimeError(
+                "Chonkie is required for the selected text chunking technique. "
+                'Install it with: pip install "chonkie[semantic]"'
+            ) from exc
+
+        if technique == "recursive":
+            from services.local_embeddings import get_project_tokenizer
+
+            tokenizer = get_project_tokenizer()
+            chunker = RecursiveChunker(tokenizer=tokenizer, chunk_size=chunk_size)
+        elif technique == "sentence":
+            from services.local_embeddings import get_project_tokenizer
+
+            tokenizer = get_project_tokenizer()
+            chunker = SentenceChunker(
+                tokenizer=tokenizer,
+                chunk_size=chunk_size,
+                chunk_overlap=overlap,
+                min_sentences_per_chunk=min_sentences_per_chunk,
+            )
+        elif technique == "token":
+            from services.local_embeddings import get_project_tokenizer
+
+            tokenizer = get_project_tokenizer()
+            chunker = TokenChunker(
+                tokenizer=tokenizer,
+                chunk_size=chunk_size,
+                chunk_overlap=overlap,
+            )
+        else:
+            chunker = SemanticChunker(
+                embedding_model=_get_chonkie_semantic_embedding_model(),
+                chunk_size=chunk_size,
+                threshold=semantic_threshold,
+            )
+
+        chunks: list[dict[str, Any]] = []
+        for section, section_blocks in sections:
+            text = "\n\n".join(block for block, _ in section_blocks).strip()
+            if not text:
+                continue
+            prefix = f"Section: {section}\n\n" if section else ""
+            max_prefix = min(300, max(1, chunk_size // 4))
+            if len(prefix) > max_prefix:
+                shortened_label = "Section: …"
+                label_budget = max(0, max_prefix - len(shortened_label) - 2)
+                prefix = (
+                    f"{shortened_label}{section[-label_budget:]}\n\n"
+                    if label_budget
+                    else ""
+                )
+            for result in chunker.chunk(text):
+                start = max(0, int(result.start_index))
+                end = min(len(text), int(result.end_index))
+                body = text[start:end].strip()
+                content = (prefix + body).strip()
+                if content:
+                    chunks.append({
+                        "chunk_id": f"{document_id}:text:{len(chunks) + 1}",
+                        "pdf_name": document_name,
+                        "section": section,
+                        "source_text": content,
+                        "chunk_technique": technique,
+                    })
+        return chunks
+
     chunks: list[dict[str, Any]] = []
     for section, section_paragraphs in sections:
         prefix = f"Section: {section}\n\n" if section else ""
         max_prefix = min(300, chunk_size // 4)
         if len(prefix) > max_prefix:
-            shortened_prefix = "Section: …\n\n"
-            label_budget = max(0, max_prefix - len(shortened_prefix))
-            prefix = (
-                shortened_prefix + section[-label_budget:]
-                if label_budget
-                else ""
-            )
+            shortened_label = "Section: …"
+            label_budget = max(0, max_prefix - len(shortened_label) - 2)
+            prefix = f"{shortened_label}{section[-label_budget:]}\n\n" if label_budget else ""
         body_limit = chunk_size - len(prefix)
         units: list[tuple[str, str]] = []
 
@@ -1926,6 +2027,7 @@ def chunk_document_text(
                     "pdf_name": document_name,
                     "section": section,
                     "source_text": content,
+                    "chunk_technique": technique,
                 })
 
         current: list[tuple[str, str]] = []
@@ -2071,6 +2173,7 @@ EXCEL_COLUMNS = [
     "question", "expected_answer",
     "actual_answer", "status", "reason", "score",
     "source_type", "source_id", "source_section", "source_text", "source_pages",
+    "chunk",
 ]
 excel_rows = []
 characteristics_data = []
@@ -2477,6 +2580,7 @@ def build_qa_records(
                     record.get("pages") or [record.get("page_no")],
                     ensure_ascii=False,
                 ),
+                "chunk": "",
             })
     text_questions: set[tuple[str, str]] = set()
     for pair in text_qa:
@@ -2491,9 +2595,13 @@ def build_qa_records(
         rows.append({
             "object_id": None,
             "pdf_name": pair.get("pdf_name"),
-            "page_no": None,
-            "analysis_mode": None,
-            "object_type": None,
+            "page_no": pair.get("page_no"),
+            "analysis_mode": (
+                f"text chunking: {pair.get('chunk_technique')}"
+                if pair.get("chunk_technique")
+                else "text chunking"
+            ),
+            "object_type": "text",
             "object_no": None,
             "object_image_paths": "[]",
             "position": None,
@@ -2513,7 +2621,11 @@ def build_qa_records(
             "source_id": pair.get("chunk_id"),
             "source_section": pair.get("section") or "",
             "source_text": pair.get("source_text") or "",
-            "source_pages": "[]",
+            "source_pages": json.dumps(
+                pair.get("pages") or ([pair["page_no"]] if pair.get("page_no") is not None else []),
+                ensure_ascii=False,
+            ),
+            "chunk": pair.get("source_text") or "",
         })
     return rows
 

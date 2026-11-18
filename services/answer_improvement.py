@@ -13,7 +13,7 @@ from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 
 from services.project_chroma import open_project_collection as _open_collection
-from services.local_embeddings import embed_texts
+from services.local_embeddings import embed_text_query
 from services.paths import PROJECT_ROOT
 
 
@@ -152,14 +152,14 @@ def resolve_session_object_images(
     if not matched_visual_question:
         raise RuntimeError(
             "The workbook service did not provide image paths, and no matching "
-            "PDF Workbench crop was found in this Streamlit session. Restart "
-            "Streamlit and upload a freshly generated workbook."
+            "PDF Workbench crop was found. Generate a fresh workbook from "
+            "PDF Workbench and upload it again."
         )
     if len(matching_paths) != 1:
         raise RuntimeError(
             "Multiple PDF Workbench crops match this question and answer. "
-            "Restart Streamlit and upload a freshly generated workbook to use "
-            "its row-specific image paths."
+            "Generate a fresh workbook from PDF Workbench to preserve "
+            "row-specific image paths."
         )
     return list(next(iter(matching_paths)))
 
@@ -173,6 +173,10 @@ def review_workbook(
         dict[str, Any],
     ],
     progress_callback: Callable[[int, int], None] | None = None,
+    aut_drift_review_fn: Callable[
+        [str, str, str, str | None, str | None, list[dict[str, Any]]],
+        dict[str, Any],
+    ] | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
     """Review each workbook answer using retrieved project context and an LLM."""
     if top_k < 1:
@@ -195,6 +199,12 @@ def review_workbook(
 
     question_column = header_columns.get(QUESTION_COLUMN)
     answer_column = header_columns.get(EXPECTED_ANSWER_COLUMN)
+    actual_answer_column = (
+        header_columns.get("actual_answer")
+        or header_columns.get("actual answer")
+    )
+    drift_traceback_column = header_columns.get("drift traceback")
+    drift_differences_column = header_columns.get("drift differences")
     object_type_column = header_columns.get(OBJECT_TYPE_COLUMN)
     image_paths_column = header_columns.get(OBJECT_IMAGE_PATHS_COLUMN)
     missing_columns = [
@@ -217,7 +227,6 @@ def review_workbook(
     ]
     if not rows:
         raise ValueError("The workbook contains no question rows to review.")
-
     def output_column(name: str) -> int:
         existing = header_columns.get(name.casefold())
         if existing is not None:
@@ -258,17 +267,48 @@ def review_workbook(
             if is_visual:
                 review = review_fn(question, expected_text, contexts, image_paths)
             else:
+                if aut_drift_review_fn is None:
+                    raise ValueError(
+                        "Text and table reviews require the grounded answer reviewer."
+                    )
                 if collection is None:
                     collection = _open_collection(project_id)
-                query_text = (
-                    f"Question: {question}\nExpected answer: {expected_text}"
-                )
-                query_vector = embed_texts([query_text])[0]
+                query_vector = embed_text_query(question)
                 record_count = collection.count()
                 current_k = min(initial_top_k, record_count)
                 while True:
                     contexts = _retrieve_context(collection, query_vector, current_k)
-                    review = review_fn(question, expected_text, contexts, [])
+                    actual_value = (
+                        worksheet.cell(row=row, column=actual_answer_column).value
+                        if actual_answer_column is not None
+                        else None
+                    )
+                    traceback_value = (
+                        worksheet.cell(row=row, column=drift_traceback_column).value
+                        if drift_traceback_column is not None
+                        else None
+                    )
+                    differences_value = (
+                        worksheet.cell(row=row, column=drift_differences_column).value
+                        if drift_differences_column is not None
+                        else None
+                    )
+                    review = aut_drift_review_fn(
+                        question,
+                        expected_text,
+                        str(actual_value).strip()
+                        if actual_value is not None
+                        else "",
+                        str(traceback_value).strip()
+                        if traceback_value is not None
+                        and str(traceback_value).strip()
+                        else None,
+                        str(differences_value).strip()
+                        if differences_value is not None
+                        and str(differences_value).strip()
+                        else None,
+                        contexts,
+                    )
                     evidence_sufficient = review.get("evidence_sufficient")
                     if not isinstance(evidence_sufficient, bool):
                         raise ValueError(

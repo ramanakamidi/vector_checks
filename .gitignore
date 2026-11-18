@@ -4,8 +4,9 @@ __pycache__/
 venv/
 node_modules/
 ui/dist/
+ui/vite.config.ts.timestamp-*.mjs
+ui/workbench_output/
 output/
-streamlit_output/
 projects/*
 !projects/.gitkeep
 demo/chroma_data/

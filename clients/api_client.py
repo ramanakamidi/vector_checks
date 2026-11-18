@@ -244,15 +244,19 @@ class ApiClient:
         question: str,
         project_id: str,
         top_k: int = 5,
+        retrieved_contexts: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "question": question,
+            "project_id": project_id,
+            "top_k": top_k,
+        }
+        if retrieved_contexts is not None:
+            payload["retrieved_contexts"] = retrieved_contexts
         return self.request(
             "POST",
             "/api/query",
-            json_body={
-                "question": question,
-                "project_id": project_id,
-                "top_k": top_k,
-            },
+            json_body=payload,
         )
 
     def execute(self, project_id: str, config: dict[str, Any]) -> dict[str, Any]:
@@ -267,9 +271,6 @@ class ApiClient:
         duplicate_max_similarity: float = 0.98,
         negative_query_texts: list[str] | None = None,
         negative_query_max_similarity: float = DEFAULT_MAX_SIMILARITY,
-        synthetic_question_record_id: str | None = None,
-        synthetic_question_texts: list[str] | None = None,
-        synthetic_question_top_k: int = 1,
     ) -> dict[str, Any]:
         return self.request(
             "POST",
@@ -282,9 +283,6 @@ class ApiClient:
                 "duplicate_max_similarity": duplicate_max_similarity,
                 "negative_query_texts": negative_query_texts or [],
                 "negative_query_max_similarity": negative_query_max_similarity,
-                "synthetic_question_record_id": synthetic_question_record_id,
-                "synthetic_question_texts": synthetic_question_texts or [],
-                "synthetic_question_top_k": synthetic_question_top_k,
             },
         )
 

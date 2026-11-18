@@ -92,6 +92,103 @@ def check_required_fields(connector: VectorDBConnector,
     }
 
 
+def check_retrieved_fields_per_question(
+    connector: VectorDBConnector,
+    required_fields: List[str],
+    retrievals_by_question: List[Dict],
+) -> Dict:
+    """Check required metadata fields on each question's retrieved records."""
+    question_results = []
+
+    for question_index, retrieval in enumerate(retrievals_by_question):
+        record_ids = list(dict.fromkeys(retrieval.get("retrieved_ids", [])))
+        field_missing_counts = {field: 0 for field in required_fields}
+        field_empty_counts = {field: 0 for field in required_fields}
+        sample_issue_ids = {field: [] for field in required_fields}
+        unavailable_records = []
+        record_results = []
+
+        for record_id in record_ids:
+            record = connector.fetch(record_id)
+            if record is None:
+                unavailable_records.append(str(record_id))
+                continue
+
+            metadata = record.metadata or {}
+            record_issues = []
+            for field in required_fields:
+                if field not in metadata:
+                    field_missing_counts[field] += 1
+                    record_issues.append({
+                        "field": field,
+                        "issue": "missing",
+                    })
+                    if str(record_id) not in sample_issue_ids[field]:
+                        sample_issue_ids[field].append(str(record_id))
+                elif _is_empty(metadata[field]):
+                    field_empty_counts[field] += 1
+                    record_issues.append({
+                        "field": field,
+                        "issue": "empty",
+                    })
+                    if str(record_id) not in sample_issue_ids[field]:
+                        sample_issue_ids[field].append(str(record_id))
+
+            record_results.append({
+                "id": str(record_id),
+                "status": "FAIL" if record_issues else "PASS",
+                "issues": record_issues,
+            })
+
+        per_field = {
+            field: {
+                "missing": field_missing_counts[field],
+                "empty": field_empty_counts[field],
+                "total_incomplete": field_missing_counts[field] + field_empty_counts[field],
+                "sample_ids": sample_issue_ids[field],
+            }
+            for field in required_fields
+        }
+        total_issues = sum(
+            item["total_incomplete"] for item in per_field.values()
+        )
+        passed = (
+            False if total_issues
+            else None if unavailable_records or not record_ids
+            else True
+        )
+        question_results.append({
+            "question_index": retrieval.get("question_index", question_index),
+            "question": retrieval.get("question", ""),
+            "retrieved_sources": retrieval.get("retrieved_sources", []),
+            "records_requested": len(record_ids),
+            "records_checked": len(record_results),
+            "required_fields": required_fields,
+            "total_issues": total_issues,
+            "per_field": per_field,
+            "record_results": record_results,
+            "unavailable_records": unavailable_records,
+            "passed": passed,
+            "status": "PASS" if passed is True else "FAIL" if passed is False else "INFO",
+        })
+
+    overall_passed = (
+        False if any(item["passed"] is False for item in question_results)
+        else None if any(item["passed"] is None for item in question_results)
+        else True
+    )
+    return {
+        "check": "metadata_completeness_by_question",
+        "passed": overall_passed,
+        "detail": {
+            "records_per_question": 3,
+            "question_count": len(question_results),
+            "required_fields": required_fields,
+            "question_results": question_results,
+        },
+    }
+
+
 def check_metadata_value_distribution(connector: VectorDBConnector,
                                        field: str,
                                        batch_size: int = 500) -> Dict:

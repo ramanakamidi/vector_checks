@@ -1,9 +1,13 @@
-import { useAzureCredentials } from '../contexts/AzureCredentialsContext';
+import type { AzureCredentials } from '../api/workbench';
 
-export default function AzureCredentialFields() {
-  const { credentials, setCredentials } = useAzureCredentials();
+interface Props {
+  credentials: AzureCredentials;
+  onChange: (credentials: AzureCredentials) => void;
+}
+
+export default function AzureCredentialFields({ credentials, onChange }: Props) {
   const update = (key: keyof typeof credentials, value: string) => {
-    setCredentials({ ...credentials, [key]: value });
+    onChange({ ...credentials, [key]: value });
   };
 
   return (

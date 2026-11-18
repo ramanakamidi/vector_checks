@@ -65,9 +65,9 @@ CHECK_CATEGORIES = {
     "known_similar_pairs": "Neighbor Consistency",
     "known_different_pairs": "Neighbor Consistency",
     "negative_query_similarity": "Similarity Calibration",
-    "synthetic_question_retrieval": "Similarity Calibration",
     "embedding_drift": "Drift Detection",
     "drift_baseline": "Drift Detection",
+    "AUT-Vector Drift": "Drift Detection",
     "searchability_spot_check": "Index Health",
     "empty_vector_audit": "Index Health",
     "embedding_visualization": "Visualization",
@@ -94,9 +94,9 @@ CHECK_DISPLAY_NAMES = {
     "known_similar_pairs": "Adjacent-Chunk Neighbor Diagnostic",
     "known_different_pairs": "Known Different Pairs",
     "negative_query_similarity": "Negative-Query Similarity Calibration",
-    "synthetic_question_retrieval": "Synthetic Question Retrieval",
     "embedding_drift": "Embedding Drift",
     "drift_baseline": "Drift Baseline",
+    "AUT-Vector Drift": "AUT-Vector Drift",
     "searchability_spot_check": "Full-Collection Searchability",
     "empty_vector_audit": "Empty Vector Audit",
     "embedding_visualization": "Embedding Space Visualization",
@@ -699,9 +699,14 @@ def _body_neighbor(r: Dict, check_name: str, chart: Optional[str]) -> str:
     if isinstance(d, str):
         body += f'<p style="color:{COLORS["text_light"]};font-size:0.85rem;">{_esc(d)}</p>'
         return body
+    pair_count_label = (
+        "Pairs checked / formed"
+        if d.get("retrievals_by_question")
+        else "Pairs checked"
+    )
     stats = [
         {
-            "label": "Pairs checked",
+            "label": pair_count_label,
             "value": (
                 f'{d.get("pairs_checked", 0)} / '
                 f'{d.get("pairs_sampled", d.get("pairs_checked", 0))}'
@@ -726,19 +731,24 @@ def _body_neighbor(r: Dict, check_name: str, chart: Optional[str]) -> str:
     pair_results = d.get("pair_results", [])
     if pair_results:
         failure_by_pair = {
-            tuple(failure.get("pair", ())): failure
+            (failure.get("question"), tuple(failure.get("pair", ()))): failure
             for failure in missed_pairs
         }
+        pair_section_title = (
+            "All question-pair checks"
+            if d.get("retrievals_by_question")
+            else "All sampled pairs"
+        )
         body += (
             '<details class="drilldown neighbor-pairs">'
-            f'<summary class="drilldown-toggle">All sampled pairs ({len(pair_results)})</summary>'
+            f'<summary class="drilldown-toggle">{_esc(pair_section_title)} ({len(pair_results)})</summary>'
             '<div class="drilldown-content open">'
         )
         for index, item in enumerate(pair_results, start=1):
             pair = item.get("pair", ("?", "?"))
             pair_key = tuple(pair)
             status = item.get("status", "unknown").replace("_", " ").title()
-            failure = failure_by_pair.get(pair_key)
+            failure = failure_by_pair.get((item.get("question"), pair_key))
             body += _neighbor_pair_card(
                 index,
                 item,
@@ -746,6 +756,46 @@ def _body_neighbor(r: Dict, check_name: str, chart: Optional[str]) -> str:
                 failure=failure,
             )
         body += '</div></details>'
+    question_retrievals = d.get("retrievals_by_question", [])
+    if question_retrievals:
+        retrieval_rows = []
+        for retrieval in question_retrievals:
+           question = str(retrieval.get("question", ""))
+           candidates = ", ".join(
+               " <-> ".join(str(record_id) for record_id in pair.get("ids", []))
+               for pair in retrieval.get("candidate_pairs", [])
+           ) or "No distinct pair (fewer than two records retrieved)"
+           check_result = retrieval.get("check_result", {})
+           check_detail = check_result.get("detail", {}) if isinstance(check_result, dict) else {}
+           if isinstance(check_detail, dict):
+               check_summary = (
+                   f'{check_detail.get("pairs_checked", 0)} pairs checked; '
+                   f'{check_detail.get("pairs_failed", 0)} failed'
+               )
+           else:
+               check_summary = str(check_detail)
+           records = retrieval.get("retrieved_records", [])
+           if not records:
+               retrieval_rows.append([
+                   question,
+                   "None",
+                   "",
+                   candidates,
+                   check_summary,
+               ])
+           for record in records:
+               retrieval_rows.append([
+                   question,
+                   str(record.get("id", "")),
+                   str(record.get("text", "")),
+                   candidates,
+                   check_summary,
+               ])
+        body += _build_drilldown(
+           "Workbook question retrievals and checks",
+           ["Question", "Retrieved record", "Retrieved text", "Checked pairs", "Pair check"],
+           retrieval_rows,
+        )
     if missed_pairs:
         body += (
             '<details class="drilldown neighbor-pairs">'
@@ -754,12 +804,12 @@ def _body_neighbor(r: Dict, check_name: str, chart: Optional[str]) -> str:
             '<div class="drilldown-content open">'
         )
         pair_result_by_pair = {
-            tuple(item.get("pair", ())): item
+            (item.get("question"), tuple(item.get("pair", ()))): item
             for item in pair_results
         }
         for index, failure in enumerate(missed_pairs, start=1):
             pair = tuple(failure.get("pair", ()))
-            item = pair_result_by_pair.get(pair, {
+            item = pair_result_by_pair.get((failure.get("question"), pair), {
                 "pair": failure.get("pair", ("?", "?")),
                 "status": "unavailable",
                 "rank_b_from_a": failure.get("rank_b_from_a"),
@@ -827,9 +877,15 @@ def _neighbor_pair_card(
     status = item.get("status", "unknown").replace("_", " ").title()
     chunk_a = item.get("chunk_a") or (failure or {}).get("chunk_a")
     chunk_b = item.get("chunk_b") or (failure or {}).get("chunk_b")
+    question = item.get("question")
+    question_html = (
+        f'<div class="neighbor-pair-id">Question: {_esc(question)}</div>'
+        if question else ""
+    )
     return (
         '<section class="neighbor-pair">'
         f'<strong>Pair {index}</strong>'
+        f'{question_html}'
         '<div class="neighbor-pair-id">'
         f'{_esc(pair[0])} &harr; {_esc(pair[1])}</div>'
         '<div class="neighbor-ranks">'
@@ -1044,48 +1100,82 @@ def _body_negative_queries(r: Dict, chart: Optional[str]) -> str:
     return body
 
 
-def _body_synthetic_question_retrieval(
-    r: Dict,
-    chart: Optional[str],
-) -> str:
+def _body_aut_vector_drift(r: Dict, chart: Optional[str]) -> str:
     detail = r.get("detail", {})
     body = _build_stats([
+        {"label": "Questions Processed", "value": str(detail.get("processed", 0))},
+        {"label": "Passed", "value": str(detail.get("passed", 0))},
+        {"label": "Drifted", "value": str(detail.get("failed", 0))},
+        {"label": "Errors", "value": str(detail.get("errors", 0))},
         {
-            "label": "Source Chunk",
-            "value": str(detail.get("source_record_id", "")),
+            "label": "Average / Maximum Drift",
+            "value": (
+                f'{_fmt(detail["average_drift_score"])} / '
+                f'{_fmt(detail["maximum_drift_score"])}'
+                if detail.get("average_drift_score") is not None
+                and detail.get("maximum_drift_score") is not None
+                else "—"
+            ),
         },
-        {"label": "Top-k", "value": str(detail.get("top_k", 0))},
-        {"label": "Passed", "value": str(detail.get("passed_questions", 0))},
-        {"label": "Failed", "value": str(detail.get("failed_questions", 0))},
     ])
-    source_text = detail.get("source_chunk_text")
-    if isinstance(source_text, str) and source_text:
-        body += (
-            '<details style="margin:0.6rem 0;padding:0.6rem;border:1px solid '
-            '#e2e8f0;border-radius:6px;">'
-            '<summary>Selected source chunk text</summary>'
-            '<pre style="white-space:pre-wrap;overflow-wrap:anywhere;">'
-            f'{_esc(source_text)}</pre></details>'
-        )
-    rows = []
+    body += (
+        '<p style="margin:0.75rem 0;color:#475569;">For each workbook question, '
+        'the judge evaluates the actual AUT answer against the retrieved vector '
+        'records. A lower drift score means stronger support from the evidence.</p>'
+    )
     for item in detail.get("question_results", []):
-        rank = item.get("source_rank")
-        rows.append([
-            str(item.get("question", "")),
-            f"Rank {rank}" if rank is not None else "Not in top-k",
-            ", ".join(str(value) for value in item.get("retrieved_ids", [])),
-        ])
-    if rows:
-        body += _build_drilldown(
-            "Generated questions and retrieval results",
-            ["Question", "Source chunk", "Retrieved record IDs"],
-            rows,
+        if not isinstance(item, dict):
+            continue
+        score = item.get("drift_score")
+        status = item.get("status", "UNKNOWN")
+        body += (
+            '<section style="margin:0.8rem 0;padding:0.8rem;border:1px solid '
+            '#e2e8f0;border-radius:8px;">'
+            f'<h4 style="margin:0 0 0.5rem;">Row {_esc(item.get("row", ""))}: '
+            f'{_esc(item.get("question", ""))}</h4>'
+            f'<p><strong>Status:</strong> {_esc(status)} &nbsp; '
+            f'<strong>Drift score:</strong> {_fmt(score) if isinstance(score, (int, float)) else "—"}</p>'
         )
+        traceback_text = item.get("traceback")
+        if isinstance(traceback_text, str) and traceback_text:
+            body += (
+                f'<p><strong>{"Drift traceback" if status != "ERROR" else "Error details"}:</strong></p>'
+                f'<p style="white-space:pre-wrap;">{_esc(traceback_text)}</p>'
+            )
+        differences = item.get("differences", [])
+        if isinstance(differences, list) and differences:
+            body += "<p><strong>Material differences</strong></p><ul>"
+            body += "".join(f"<li>{_esc(value)}</li>" for value in differences)
+            body += "</ul>"
+        body += (
+            '<div style="margin:0.75rem 0;padding:0.75rem;background:#f8fafc;'
+            'border-radius:6px;">'
+            f'<strong>Actual AUT answer</strong><p style="white-space:pre-wrap;">'
+            f'{_esc(item.get("actual_answer", ""))}</p></div>'
+        )
+        records = item.get("retrieved_records", [])
+        if isinstance(records, list) and records:
+            body += (
+                f'<details><summary>Retrieved vector records judged as evidence ({len(records)})</summary>'
+            )
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                metadata = record.get("metadata") or {}
+                body += (
+                    '<div style="margin:0.5rem 0;padding:0.5rem;background:#f8fafc;">'
+                    f'<strong>{_esc(record.get("id", ""))}</strong>'
+                    f'<p style="white-space:pre-wrap;">{_esc(record.get("text", ""))}</p>'
+                    f'<small style="white-space:pre-wrap;">{_esc(json.dumps(metadata, ensure_ascii=False, default=str))}</small>'
+                    '</div>'
+                )
+            body += "</details>"
+        body += "</section>"
     if chart:
         body += CHART_EMBED_TEMPLATE.format(
             image_b64=chart,
-            alt_text="Synthetic question retrieval",
-            help_text="Whether generated questions retrieve their source chunk in top-k.",
+            alt_text="AUT-Vector Drift",
+            help_text="Per-question judge scores for actual AUT answers against retrieved vector evidence.",
         )
     return body
 
@@ -1102,7 +1192,7 @@ _BODY_BUILDERS = {
     "known_similar_pairs": lambda r, c: _body_neighbor(r, "known_similar_pairs", c),
     "known_different_pairs": lambda r, c: _body_neighbor(r, "known_different_pairs", c),
     "negative_query_similarity": _body_negative_queries,
-    "synthetic_question_retrieval": _body_synthetic_question_retrieval,
+    "AUT-Vector Drift": _body_aut_vector_drift,
     "embedding_drift": lambda r, c: _body_drift(r, c),
     "drift_baseline": lambda r, c: _body_generic(r, c),
     "stored_vs_indexed_count": lambda r, c: _body_stored_vs_indexed(r, c),

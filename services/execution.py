@@ -27,6 +27,7 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -66,7 +67,7 @@ class ExecutionService:
             - aut_project_id (str): project_id to pass to the AUT
             - run_vector_checks (bool): whether to run vector store checks
             - checks_to_run (list[str]): which checks to run
-            - collection_name (str, optional): Chroma collection name
+            - collection_name (str, optional): Project vector collection name
 
         Returns
         -------
@@ -327,34 +328,55 @@ class ExecutionService:
     def _run_vector_checks(
         self, collection_name: str, checks_to_run: List[str]
     ) -> Dict[str, Any]:
-        """Run vector store health checks using the project's Chroma store."""
-        chroma_path = os.path.join(self.project_dir, "chroma_data")
-        if not os.path.isdir(chroma_path):
+        """Run vector store health checks using the project's selected store."""
+        try:
+            with open(
+                os.path.join(self.project_dir, "config.json"),
+                "r",
+                encoding="utf-8",
+            ) as config_file:
+                config = json.load(config_file)
+        except (OSError, json.JSONDecodeError) as exc:
+            return {
+                "status": "error",
+                "message": f"Could not read project configuration: {exc}",
+                "summary": {},
+                "checks": [],
+            }
+        vector_config = (
+            (config.get("settings") or {}).get("vector_store_config") or {}
+        )
+        db_type = vector_config.get("db_type", "chroma")
+        from services.project_chroma import default_storage_location
+
+        persist_directory = vector_config.get("persist_directory") or os.fspath(
+            default_storage_location(self.project_dir, db_type)
+        )
+        location_exists = (
+            os.path.exists(persist_directory)
+            if db_type == "milvus_lite"
+            else os.path.isdir(persist_directory)
+        )
+        if not location_exists:
             return {
                 "status": "skipped",
-                "message": "No Chroma data directory found.",
+                "message": f"No {db_type.upper()} data directory found.",
                 "summary": {},
                 "checks": [],
             }
 
         try:
-            import chromadb
+            from services.project_chroma import open_project_collection
 
-            client = chromadb.PersistentClient(path=chroma_path)
-            try:
-                collection = client.get_collection(collection_name)
-            except Exception:
-                # Try listing collections and use the first one
-                collections = client.list_collections()
-                if not collections:
-                    return {
-                        "status": "skipped",
-                        "message": "No collections found in Chroma store.",
-                        "summary": {},
-                        "checks": [],
-                    }
-                collection = collections[0] if hasattr(collections[0], 'count') else client.get_collection(
-                    collections[0].name if hasattr(collections[0], 'name') else str(collections[0])
+            collection = open_project_collection(
+                self.project_id,
+                create=True,
+                projects_dir=Path(self.project_dir).parent,
+            )
+            if collection_name and collection_name != collection.name:
+                raise ValueError(
+                    f"Requested collection {collection_name!r} does not match "
+                    f"the project's configured collection {collection.name!r}."
                 )
 
             count = collection.count()

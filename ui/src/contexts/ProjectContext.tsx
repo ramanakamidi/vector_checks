@@ -10,7 +10,11 @@ interface ProjectContextValue {
   activeProject: Project | null;
   setActiveProject: (project: Project | null) => void;
   refreshProjects: () => Promise<Project[]>;
-  createProject: (name: string, description?: string) => Promise<Project>;
+  createProject: (
+    name: string,
+    description?: string,
+    dbType?: 'chroma' | 'faiss' | 'milvus_lite',
+  ) => Promise<Project>;
   loading: boolean;
 }
 
@@ -43,8 +47,12 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const createProject = useCallback(
-    async (name: string, description = '') => {
-      const project = await apiCreateProject(name, description);
+    async (
+      name: string,
+      description = '',
+      dbType: 'chroma' | 'faiss' | 'milvus_lite' = 'chroma',
+    ) => {
+      const project = await apiCreateProject(name, description, dbType);
       const freshProjects = await refreshProjects();
       // Find the project in the refreshed list to get the full object with status
       const found = freshProjects.find((p: Project) => p.id === project.id);

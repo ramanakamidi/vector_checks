@@ -32,6 +32,19 @@ export default function ProjectSelector() {
             </div>
 
             <div className="max-h-64 overflow-y-auto">
+              <button
+                onClick={() => {
+                  setActiveProject(null);
+                  setOpen(false);
+                }}
+                aria-pressed={!activeProject}
+                className={`w-full text-left px-4 py-3 hover:bg-slate-50 transition-colors flex items-center gap-3 border-b border-slate-100 ${
+                  !activeProject ? 'bg-blue-50' : ''
+                }`}
+              >
+                <div className={`w-2 h-2 rounded-full ${!activeProject ? 'bg-cognizant-blue' : 'bg-slate-300'}`} />
+                <span className="text-sm font-medium text-slate-600">No project selected</span>
+              </button>
               {projects.length === 0 && (
                 <p className="text-sm text-slate-400 px-4 py-3 text-center">
                   No projects yet

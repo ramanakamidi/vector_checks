@@ -1,10 +1,5 @@
 """
-Ingestion Service — handles JSON Q&A data ingestion into project-specific
-Chroma vector stores.
-
-Each project gets its own PersistentClient at
-``projects/{project_id}/chroma_data/`` with a collection named
-``{project_id}_knowledge_base``.
+Ingestion Service — handles JSON Q&A data ingestion into project vector stores.
 
 Usage::
 
@@ -19,44 +14,42 @@ Usage::
 
 import json
 import os
-import shutil
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from services.paths import PROJECTS_DIR
+from services.project_chroma import open_project_collection
 
 
 class IngestionService:
-    """Manages ingestion of Q&A JSON data into a project-specific Chroma store."""
+    """Manages ingestion of Q&A JSON data into a project's selected vector store."""
 
     def __init__(self, project_id: str, projects_dir: Optional[str] = None):
         if projects_dir is None:
             projects_dir = os.fspath(PROJECTS_DIR)
         self.project_id = project_id
         self.project_dir = os.path.join(projects_dir, project_id)
-        self.chroma_path = os.path.join(self.project_dir, "chroma_data")
         self.json_path = os.path.join(self.project_dir, "ingested_data.json")
         self.collection_name = f"{project_id}_knowledge_base"
+        self.projects_dir = projects_dir
 
         if not os.path.isdir(self.project_dir):
             raise FileNotFoundError(f"Project directory not found: {self.project_dir}")
 
-    def _get_chroma_collection(self):
-        """Create or connect to the project-specific Chroma collection."""
-        import chromadb
-
-        os.makedirs(self.chroma_path, exist_ok=True)
-        client = chromadb.PersistentClient(path=self.chroma_path)
-        collection = client.get_or_create_collection(
-            name=self.collection_name,
-            metadata={"hnsw:space": "cosine"},
-            embedding_function=None,
+    def _get_collection(self):
+        """Create or connect to the project's configured vector collection."""
+        collection = open_project_collection(
+            self.project_id,
+            create=True,
+            projects_dir=Path(self.projects_dir),
         )
-        return client, collection
+        self.collection_name = collection.name
+        return collection
 
     def ingest_json(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Validate and ingest Q&A records into Chroma and save a JSON backup.
+        """Validate and ingest Q&A records and save a JSON backup.
 
         Parameters
         ----------
@@ -108,8 +101,8 @@ class IngestionService:
                 "errors": errors or ["No valid records found in the input"],
             }
 
-        # ── Ingest into Chroma ────────────────────────────────────
-        _client, collection = self._get_chroma_collection()
+        # ── Ingest into the selected vector store ─────────────────
+        collection = self._get_collection()
 
         # Chroma batch-add (max 5461 per batch due to Chroma limits)
         batch_size = 5000
@@ -226,7 +219,7 @@ class IngestionService:
         dict
             ``{"total_records": N, "collections": [...],
               "metadata_fields": [...], "ingested_at": "...",
-              "chroma_path": "..."}``
+              "persist_directory": "..."}``
         """
         records = self._load_json_backup()
         total = len(records)
@@ -249,53 +242,42 @@ class IngestionService:
             except (json.JSONDecodeError, OSError):
                 pass
 
-        # Check if Chroma collection exists
-        collections: List[str] = []
-        if os.path.isdir(self.chroma_path):
-            try:
-                import chromadb
-
-                client = chromadb.PersistentClient(path=self.chroma_path)
-                raw = client.list_collections()
-                for c in raw:
-                    collections.append(c.name if hasattr(c, "name") else str(c))
-            except Exception:
-                if total > 0:
-                    collections = [self.collection_name]
+        collection = self._get_collection()
+        collections: List[str] = (
+            [collection.name] if collection.count() or total else []
+        )
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        persist_directory = (
+            cfg.get("settings", {})
+            .get("vector_store_config", {})
+            .get("persist_directory", "")
+        )
 
         return {
             "total_records": total,
             "collections": collections,
             "metadata_fields": sorted(meta_fields),
             "ingested_at": ingested_at,
-            "chroma_path": self.chroma_path,
+            "persist_directory": persist_directory,
+            "chroma_path": persist_directory,
         }
 
     def clear_data(self) -> Dict[str, Any]:
-        """Delete the Chroma collection and JSON backup file.
+        """Delete the project's vector records and JSON backup file.
 
         Returns
         -------
         dict
             ``{"status": "success", "message": "All ingested data cleared"}``
         """
-        # Delete Chroma collection
-        if os.path.isdir(self.chroma_path):
-            try:
-                import chromadb
-
-                client = chromadb.PersistentClient(path=self.chroma_path)
-                try:
-                    client.delete_collection(self.collection_name)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-            # Remove the entire chroma_data directory
-            try:
-                shutil.rmtree(self.chroma_path)
-            except Exception:
-                pass
+        collection = self._get_collection()
+        while True:
+            batch = collection.get(limit=5000, include=[])
+            ids = batch.get("ids") or []
+            if not ids:
+                break
+            collection.delete(ids=ids)
 
         # Delete JSON backup
         if os.path.isfile(self.json_path):

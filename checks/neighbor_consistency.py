@@ -9,6 +9,7 @@ ground-truth labels.
 """
 
 import random
+from itertools import combinations
 from typing import Dict, List, Tuple
 
 from connectors.base import VectorDBConnector, VectorRecord
@@ -77,6 +78,71 @@ def generate_adjacent_chunk_pairs(
     if len(candidate_pairs) > max_pairs:
         return random.Random(0).sample(candidate_pairs, max_pairs)
     return candidate_pairs
+
+
+def retrieve_record_pairs_for_questions(
+    connector: VectorDBConnector,
+    questions: list[str],
+    top_k: int = 5,
+) -> tuple[list[Tuple[str, str]], list[Dict]]:
+    """Retrieve top-k records per question and pair every distinct retrieved record."""
+    if not 1 <= top_k <= 100:
+        raise ValueError("Question retrieval top-k must be between 1 and 100.")
+    if not questions:
+        raise ValueError("At least one question is required for question-based neighbors.")
+
+    from services.local_embeddings import embed_text_query
+
+    embeddings = [embed_text_query(question) for question in questions]
+    all_pairs: dict[Tuple[str, str], None] = {}
+    retrievals = []
+    for question, embedding in zip(questions, embeddings):
+        vector = embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)
+        retrieved = connector.knn_search(
+            vector,
+            k=min(top_k, connector.count()),
+        )
+        retrieved_ids = [record.id for record in retrieved]
+        unique_retrieved_ids = list(dict.fromkeys(retrieved_ids))
+        retrieved_records = []
+        retrieved_sources = []
+        for record in retrieved:
+            metadata = dict(record.metadata or {})
+            text = metadata.pop("document", "")
+            retrieved_records.append({
+                "id": record.id,
+                "text": text if isinstance(text, str) else "",
+                "metadata": metadata,
+            })
+            source = {"id": record.id}
+            pdf_name = metadata.get("pdf_name")
+            page_number = metadata.get("page_number", metadata.get("page_no"))
+            source_pages = metadata.get("source_pages", metadata.get("pages"))
+            if pdf_name is not None:
+                source["pdf_name"] = pdf_name
+            if page_number is not None:
+                source["page_number"] = page_number
+            if source_pages is not None:
+                source["source_pages"] = source_pages
+            retrieved_sources.append(source)
+        matching_pairs = [
+            (id_a, id_b)
+            for id_a, id_b in combinations(unique_retrieved_ids, 2)
+        ]
+        for pair in matching_pairs:
+            all_pairs.setdefault(pair, None)
+        retrievals.append({
+            "question": question,
+            "retrieved_ids": retrieved_ids,
+            "retrieved_records": retrieved_records,
+            "retrieved_sources": retrieved_sources,
+            "candidate_pairs": [
+                {"ids": list(pair), "questions": [question]}
+                for pair in matching_pairs
+            ],
+        })
+
+    return list(all_pairs), retrievals
 
 
 def _same_chunk_context(record_a: VectorRecord, record_b: VectorRecord) -> bool:

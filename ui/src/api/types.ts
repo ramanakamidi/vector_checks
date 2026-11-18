@@ -87,6 +87,19 @@ export interface PaginatedRecords {
   page_size: number;
 }
 
+export interface ProjectVectorRecord {
+  id: string;
+  text: string;
+  metadata: Record<string, unknown>;
+}
+
+export interface PaginatedVectorRecords {
+  records: ProjectVectorRecord[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
 // ── Dataset Generation Types ──
 
 export interface DatasetConfig {

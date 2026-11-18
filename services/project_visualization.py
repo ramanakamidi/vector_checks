@@ -1,8 +1,12 @@
-"""Build a UMAP and HDBSCAN view of a project's persisted Chroma vectors."""
+"""Build a UMAP and HDBSCAN view of a project's persisted vectors."""
 
 from __future__ import annotations
 
+import threading
 from typing import Any
+
+
+_VISUALIZATION_COMPUTE_LOCK = threading.Lock()
 
 
 def build_project_visualization(
@@ -23,7 +27,7 @@ def build_project_visualization(
     except ImportError as exc:
         raise ImportError(
             "Vector visualization requires NumPy. "
-            "Install the project's Streamlit requirements."
+            "Install the project's Python requirements."
         ) from exc
 
     collection = open_project_collection(project_id)
@@ -88,29 +92,33 @@ def build_project_visualization(
     try:
         import umap
         from sklearn.cluster import HDBSCAN
+        from threadpoolctl import threadpool_limits
     except ImportError as exc:
         raise ImportError(
             "UMAP visualization requires scikit-learn and 'umap-learn'. "
-            "Install the project's Streamlit requirements."
+            "Install the project's Python requirements."
         ) from exc
 
     vector_matrix = np.vstack(vectors)
-    coordinates = umap.UMAP(
-        n_components=2,
-        metric="cosine",
-        n_neighbors=min(15, len(vectors) - 1),
-        init="random",
-        n_jobs=1,
-        random_state=42,
-    ).fit_transform(vector_matrix)
+    with _VISUALIZATION_COMPUTE_LOCK:
+        with threadpool_limits(limits=1):
+            coordinates = umap.UMAP(
+                n_components=2,
+                metric="cosine",
+                n_neighbors=min(15, len(vectors) - 1),
+                init="random",
+                n_epochs=100,
+                n_jobs=1,
+                random_state=42,
+            ).fit_transform(vector_matrix)
 
-    effective_min_cluster_size = min(min_cluster_size, len(vectors))
-    clusters = HDBSCAN(
-        min_cluster_size=max(2, effective_min_cluster_size),
-        min_samples=1,
-        metric="euclidean",
-        copy=True,
-    ).fit_predict(coordinates)
+            effective_min_cluster_size = min(min_cluster_size, len(vectors))
+            clusters = HDBSCAN(
+                min_cluster_size=max(2, effective_min_cluster_size),
+                min_samples=1,
+                metric="euclidean",
+                copy=True,
+            ).fit_predict(coordinates)
 
     points = [
         {

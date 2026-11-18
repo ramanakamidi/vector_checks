@@ -8,7 +8,7 @@ import { useLocation } from 'react-router-dom';
 export default function AppLayout() {
   const { activeProject, loading } = useProject();
   const { pathname } = useLocation();
-  const projectOptional = pathname === '/pdf-workbench';
+  const projectOptional = ['/', '/pdf-workbench', '/app-under-test'].includes(pathname);
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col">

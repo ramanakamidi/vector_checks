@@ -1,15 +1,13 @@
 import { useLocation, useNavigate } from 'react-router-dom';
-import { Settings, Upload, Layers, Play, FileSearch, FileCheck2, Eye } from 'lucide-react';
+import { Settings, Play, FileSearch, FileCheck2, Eye } from 'lucide-react';
 import { useProject } from '../contexts/ProjectContext';
 
 const NAV_ITEMS = [
-  { path: '/settings', label: 'Project setup', icon: Settings, stage: 1 },
-  { path: '/ingestion', label: 'Ingestion', icon: Upload, stage: 2 },
-  { path: '/generation', label: 'Data Generation', icon: Layers, stage: 3 },
-  { path: '/execution', label: 'Execution', icon: Play, stage: 4 },
-  { path: '/pdf-workbench', label: 'PDF Workbench', icon: FileSearch, stage: 5 },
-  { path: '/answer-improvement', label: 'Answer Improvement', icon: FileCheck2, stage: 6 },
-  { path: '/visual-check', label: 'Visual Check', icon: Eye, stage: 7 },
+  { path: '/pdf-workbench', label: 'Test Data Generation', icon: FileSearch, stage: 1 },
+  { path: '/execution', label: 'Execution', icon: Play, stage: 2 },
+  { path: '/answer-improvement', label: 'Answer Improvement', icon: FileCheck2, stage: 3 },
+  { path: '/visual-check', label: 'Embedding Explorer', icon: Eye, stage: 4 },
+  { path: '/app-under-test', label: 'Configure', icon: Settings, stage: 5 },
 ] as const;
 
 export default function Sidebar() {
@@ -27,7 +25,7 @@ export default function Sidebar() {
         {NAV_ITEMS.map((item) => {
           const isActive = location.pathname === item.path;
           const Icon = item.icon;
-          const disabled = !activeProject && item.path !== '/pdf-workbench';
+          const disabled = !activeProject && !['/pdf-workbench', '/app-under-test'].includes(item.path);
 
           return (
             <button

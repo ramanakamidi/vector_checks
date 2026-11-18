@@ -127,8 +127,15 @@ class ProjectManager:
                     continue
         return projects
 
-    def create(self, name: str, description: str = "") -> Dict[str, Any]:
+    def create(
+        self,
+        name: str,
+        description: str = "",
+        db_type: str = "chroma",
+    ) -> Dict[str, Any]:
         """Create a new project with default settings."""
+        if db_type not in {"chroma", "faiss", "milvus_lite"}:
+            raise ValueError(f"Unsupported vector store type: {db_type!r}.")
         project_id = self._generate_id()
         project_dir = self._project_dir(project_id)
         os.makedirs(project_dir, exist_ok=True)
@@ -136,10 +143,18 @@ class ProjectManager:
 
         now = self._now_iso()
         settings = json.loads(json.dumps(DEFAULT_SETTINGS))
-        settings["vector_store_config"]["collection_name"] = f"{project_id}_chunks"
-        settings["vector_store_config"]["persist_directory"] = os.path.join(
-            project_dir, "chroma_data"
+        store_location = (
+            os.path.join(project_dir, "faiss_data")
+            if db_type == "faiss"
+            else os.path.join(project_dir, "milvus_lite.db")
+            if db_type == "milvus_lite"
+            else os.path.join(project_dir, "chroma_data")
         )
+        settings["vector_store_config"]["db_type"] = db_type
+        settings["vector_store_config"]["collection_name"] = (
+            f"{project_id}_knowledge_base"
+        )
+        settings["vector_store_config"]["persist_directory"] = store_location
 
         config: Dict[str, Any] = {
             "id": project_id,
@@ -174,6 +189,14 @@ class ProjectManager:
         project_dir = self._project_dir(project_id)
         if not os.path.isdir(project_dir):
             raise FileNotFoundError(f"Project '{project_id}' not found.")
+        from connectors.milvus_lite_connector import is_database_open
+
+        database_path = os.path.join(project_dir, "milvus_lite.db")
+        if is_database_open(database_path):
+            raise RuntimeError(
+                "This project's Milvus Lite database is open. Restart the backend "
+                "before deleting the project."
+            )
         shutil.rmtree(project_dir)
 
     def update_settings(self, project_id: str,
@@ -181,6 +204,17 @@ class ProjectManager:
         """Merge partial settings update into existing config."""
         config = self._read_config(project_id)
         existing = config.get("settings", {})
+        current_vector_config = existing.get("vector_store_config", {})
+        requested_vector_config = settings_update.get("vector_store_config")
+        if isinstance(requested_vector_config, dict):
+            for key in ("db_type", "collection_name", "persist_directory"):
+                current_value = current_vector_config.get(key)
+                requested_value = requested_vector_config.get(key, current_value)
+                if requested_value != current_value:
+                    raise ValueError(
+                        "A project's vector database, collection, and storage "
+                        "directory are fixed when the project is created."
+                    )
         for key, value in settings_update.items():
             if isinstance(value, dict) and isinstance(existing.get(key), dict):
                 existing[key].update(value)

@@ -15,6 +15,7 @@ The sample_size parameter controls how many vectors to spot-check.
 
 import math
 import re
+from itertools import combinations
 from typing import Dict, List
 
 from connectors.base import VectorDBConnector
@@ -201,6 +202,171 @@ def find_near_duplicates(connector: VectorDBConnector,
                 "does not automatically declare pairs to be duplicates. It checks "
                 f"up to {k} nearest neighbors for each of "
                 f"{min(scanned, sample_size)} sampled vectors."
+            ),
+        },
+    }
+
+
+def find_near_duplicates_for_questions(
+    connector: VectorDBConnector,
+    retrievals_by_question: List[Dict],
+    minimum_similarity: float = DEFAULT_MIN_SIMILARITY,
+    maximum_similarity: float = DEFAULT_MAX_SIMILARITY,
+    metadata_fields: List[str] | None = None,
+) -> Dict:
+    """Find similarity candidates among the records retrieved for each question."""
+    if not MIN_SIMILARITY_THRESHOLD <= minimum_similarity <= MAX_SIMILARITY_THRESHOLD:
+        raise ValueError(
+            "minimum_similarity must be between "
+            f"{MIN_SIMILARITY_THRESHOLD:.2f} and {MAX_SIMILARITY_THRESHOLD:.2f}."
+        )
+    if not MIN_SIMILARITY_THRESHOLD <= maximum_similarity <= MAX_SIMILARITY_THRESHOLD:
+        raise ValueError(
+            "maximum_similarity must be between "
+            f"{MIN_SIMILARITY_THRESHOLD:.2f} and {MAX_SIMILARITY_THRESHOLD:.2f}."
+        )
+    if minimum_similarity > maximum_similarity:
+        raise ValueError("minimum_similarity cannot exceed maximum_similarity.")
+
+    display_metadata_fields = (
+        metadata_fields
+        if metadata_fields is not None
+        else DEFAULT_METADATA_FIELDS
+    )
+    question_results: List[Dict] = []
+    total_pairs_compared = 0
+    total_unavailable_pairs = 0
+    total_candidates_found = 0
+
+    for question_index, retrieval in enumerate(retrievals_by_question):
+        question = retrieval["question"]
+        record_ids = list(dict.fromkeys(retrieval.get("retrieved_ids", [])))
+        records = {
+            record_id: connector.fetch(record_id)
+            for record_id in record_ids
+        }
+        candidate_pairs: List[Dict] = []
+        unavailable_pairs: List[Dict] = []
+        pairs_compared = 0
+
+        for id_a, id_b in combinations(record_ids, 2):
+            record_a = records[id_a]
+            record_b = records[id_b]
+            if record_a is None or record_b is None:
+                unavailable_pairs.append({
+                    "id_a": id_a,
+                    "id_b": id_b,
+                    "reason": "One or both retrieved records could not be fetched.",
+                })
+                continue
+            if not record_a.vector or not record_b.vector:
+                unavailable_pairs.append({
+                    "id_a": id_a,
+                    "id_b": id_b,
+                    "reason": "One or both records have no vector.",
+                })
+                continue
+            vector_a = record_a.vector
+            vector_b = record_b.vector
+            if len(vector_a) != len(vector_b):
+                unavailable_pairs.append({
+                    "id_a": id_a,
+                    "id_b": id_b,
+                    "reason": "The records have different vector dimensions.",
+                })
+                continue
+            if not all(
+                math.isfinite(float(value))
+                for value in vector_a + vector_b
+            ):
+                unavailable_pairs.append({
+                    "id_a": id_a,
+                    "id_b": id_b,
+                    "reason": "One or both records have a non-finite vector value.",
+                })
+                continue
+            if (
+                sum(value * value for value in vector_a) < 1e-20
+                or sum(value * value for value in vector_b) < 1e-20
+            ):
+                unavailable_pairs.append({
+                    "id_a": id_a,
+                    "id_b": id_b,
+                    "reason": "One or both records have a zero-magnitude vector.",
+                })
+                continue
+
+            pairs_compared += 1
+            similarity = _cosine_similarity(record_a.vector, record_b.vector)
+            if not minimum_similarity <= similarity <= maximum_similarity:
+                continue
+
+            metadata_a = record_a.metadata or {}
+            metadata_b = record_b.metadata or {}
+            chunk_a = metadata_a.get("document")
+            chunk_b = metadata_b.get("document")
+            candidate = {
+                "id_a": str(id_a),
+                "id_b": str(id_b),
+                "cosine_similarity": round(similarity, 6),
+                "text_token_overlap": (
+                    _text_token_overlap(chunk_a, chunk_b)
+                    if isinstance(chunk_a, str) and isinstance(chunk_b, str)
+                    else None
+                ),
+                "metadata_a": {
+                    key: metadata_a[key]
+                    for key in display_metadata_fields
+                    if key in metadata_a
+                },
+                "metadata_b": {
+                    key: metadata_b[key]
+                    for key in display_metadata_fields
+                    if key in metadata_b
+                },
+            }
+            if isinstance(chunk_a, str):
+                candidate["chunk_a"] = chunk_a
+            if isinstance(chunk_b, str):
+                candidate["chunk_b"] = chunk_b
+
+            candidate_pairs.append(candidate)
+
+        total_pairs_compared += pairs_compared
+        total_unavailable_pairs += len(unavailable_pairs)
+        total_candidates_found += len(candidate_pairs)
+        question_results.append({
+            "question_index": question_index,
+            "question": question,
+            "retrieved_ids": record_ids,
+            "retrieved_sources": retrieval.get("retrieved_sources", []),
+            "pairs_compared": pairs_compared,
+            "candidate_pairs_found": len(candidate_pairs),
+            "candidate_pairs": candidate_pairs,
+            "unavailable_pairs": unavailable_pairs,
+            "status": (
+                "CANDIDATES" if candidate_pairs
+                else "INCOMPLETE" if unavailable_pairs or not pairs_compared
+                else "CLEAR"
+            ),
+        })
+
+    return {
+        "check": "near_duplicate_detection_by_question",
+        "passed": None,
+        "detail": {
+            "pair_source": "distinct records retrieved for each workbook question",
+            "question_count": len(question_results),
+            "minimum_similarity": minimum_similarity,
+            "maximum_similarity": maximum_similarity,
+            "pairs_compared": total_pairs_compared,
+            "candidate_pairs_found": total_candidates_found,
+            "unavailable_pairs": total_unavailable_pairs,
+            "question_results": question_results,
+            "methodology_note": (
+                "Candidates are record pairs from each question's retrieved top-k. "
+                "A pair may appear for more than one question. Similarity indicates "
+                "embedding proximity, not duplicate text; review the chunk contents."
             ),
         },
     }

@@ -27,7 +27,7 @@ import traceback
 from typing import Dict, List, Optional, Tuple
 
 from connectors.base import VectorDBConnector
-from checks import vector_integrity, metadata_completeness, duplicate_detection, index_health
+from checks import vector_integrity, metadata_completeness, duplicate_detection
 from checks import neighbor_consistency
 
 
@@ -97,12 +97,6 @@ def run_full_report(connector: VectorDBConnector,
                 field_mapper=field_mapper))
         except Exception as e:
             results.append(_error_result("metadata_completeness", e))
-
-    # Category 6: Index Health
-    try:
-        results.append(index_health.check_searchability(connector))
-    except Exception as e:
-        results.append(_error_result("searchability_spot_check", e))
 
     # Category 2: Generate likely-similar examples from adjacent chunks.
     try:

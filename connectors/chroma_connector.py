@@ -80,17 +80,22 @@ class ChromaConnector(VectorDBConnector):
     def knn_search(self, vector: List[float], k: int = 10) -> List[VectorRecord]:
         result = self.collection.query(
             query_embeddings=[vector], n_results=k,
-            include=["embeddings", "metadatas"],
+            include=["embeddings", "metadatas", "documents"],
         )
         records = []
         ids_list = result["ids"][0] if result["ids"] else []
         embeddings = result["embeddings"][0] if result["embeddings"] is not None else None
         metadatas = result["metadatas"][0] if result["metadatas"] is not None else None
+        documents = result.get("documents")
+        documents = documents[0] if documents else []
         for i, rid in enumerate(ids_list):
+            metadata = self._safe_metadata(metadatas, i)
+            if i < len(documents) and documents[i]:
+                metadata["document"] = documents[i]
             records.append(VectorRecord(
                 id=rid,
                 vector=self._safe_embedding(embeddings, i),
-                metadata=self._safe_metadata(metadatas, i),
+                metadata=metadata,
             ))
         return records
 

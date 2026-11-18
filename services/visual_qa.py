@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 from collections import defaultdict
 from io import BytesIO
@@ -43,7 +42,29 @@ def load_workbench_qa_workbook(content: bytes) -> list[dict[str, Any]]:
                 raise ValueError(f"Workbook contains a duplicate {header!r} column.")
             header_columns[header] = column - 1
 
-    required = {"question", "expected_answer"}
+    legacy_source_columns = {
+        "source_type",
+        "source_id",
+        "source_section",
+        "source_text",
+        "source_pages",
+    }
+    if legacy_source_columns.intersection(header_columns):
+        raise ValueError(
+            "This workbook uses obsolete source metadata columns. "
+            "Regenerate it using the current Test Data Generation tab."
+        )
+
+    required = {
+        "pdf_name",
+        "page_no",
+        "object_id",
+        "object_type",
+        "description",
+        "question",
+        "expected_answer",
+        "chunk",
+    }
     missing = required - header_columns.keys()
     if missing:
         raise ValueError(
@@ -58,28 +79,29 @@ def load_workbench_qa_workbook(content: bytes) -> list[dict[str, Any]]:
             continue
 
         object_type = _cell_text(values, header_columns.get("object_type")).casefold()
-        source_type = _cell_text(values, header_columns.get("source_type")).casefold()
-        if source_type == "object":
-            source_type = "table" if object_type == "table" else ""
-        elif not source_type:
-            source_type = "table" if object_type == "table" else "text" if not object_type else ""
+        source_type = (
+            "table"
+            if object_type == "table"
+            else "text"
+            if object_type == "text"
+            else ""
+        )
         if source_type not in {"table", "text"}:
             continue
 
+        page_no = _page_number(
+            _cell_value(values, header_columns.get("page_no"))
+        )
         rows.append({
             "pdf_name": _cell_text(values, header_columns.get("pdf_name")),
-            "page_no": _page_number(
-                _cell_value(values, header_columns.get("page_no"))
-            ),
-            "source_pages": _parse_pages(
-                _cell_value(values, header_columns.get("source_pages"))
-            ),
+            "page_no": page_no,
+            "source_pages": [page_no] if page_no is not None else [],
             "object_type": object_type,
             "object_id": _cell_text(values, header_columns.get("object_id")),
             "source_type": source_type,
-            "source_id": _cell_text(values, header_columns.get("source_id")),
-            "source_section": _cell_text(values, header_columns.get("source_section")),
-            "source_text": _cell_text(values, header_columns.get("source_text")),
+            "source_id": _cell_text(values, header_columns.get("object_id")),
+            "source_section": _cell_text(values, header_columns.get("description")),
+            "source_text": _cell_text(values, header_columns.get("chunk")),
             "category": _cell_text(values, header_columns.get("category")),
             "characteristics": _cell_text(
                 values,
@@ -208,18 +230,6 @@ def _page_number(value: Any) -> int | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return page if page > 0 else None
-
-
-def _parse_pages(value: Any) -> list[int]:
-    if not isinstance(value, str) or not value.strip():
-        return []
-    try:
-        pages = json.loads(value)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(pages, list):
-        return []
-    return [page for item in pages if (page := _page_number(item)) is not None]
 
 
 def _filename(value: Any) -> str:

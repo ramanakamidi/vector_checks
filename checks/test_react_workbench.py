@@ -9,6 +9,56 @@ from services import react_workbench
 
 
 class ReactWorkbenchTests(unittest.TestCase):
+    def test_saved_session_restores_object_images_after_memory_is_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_root = Path(temp_dir)
+            session_id = "a" * 32
+            session_dir = output_root / session_id
+            object_dir = session_dir / "objects"
+            object_dir.mkdir(parents=True)
+            image_path = object_dir / "sample_page2_table1.png"
+            image_path.write_bytes(b"png")
+            state = {
+                "session_dir": str(session_dir),
+                "objects": [{
+                    "object_id": "doc-1:page-2:table-1",
+                    "doc_name": "sample.pdf",
+                    "page_no": 2,
+                    "pages": [2],
+                    "object_type": "table",
+                    "object_no": "table 1",
+                    "position": "top",
+                    "docling_title": "Sample table",
+                    "characteristics": {"content_summary": "A test table."},
+                    "parts": [{"image_path": str(image_path)}],
+                }],
+                "documents": [],
+                "text_chunks": [],
+                "text_errors": [],
+                "chunking": {},
+                "mode": "crop",
+                "qa_by_object": {},
+                "text_qa": [],
+            }
+
+            with (
+                patch.object(react_workbench, "_output_root", output_root),
+                patch.dict(react_workbench._sessions, {}, clear=True),
+                patch.object(react_workbench.custom_logic, "build_qa_records", return_value=[]),
+            ):
+                react_workbench._save_session(session_id, state)
+                restored = react_workbench.get_session(session_id)
+                restored_image = react_workbench.get_object_image(
+                    session_id,
+                    "doc-1:page-2:table-1",
+                    0,
+                )
+
+        self.assertEqual(restored["objects"][0]["image_urls"], [
+            f"/api/workbench/{session_id}/objects/doc-1:page-2:table-1/image?part=0",
+        ])
+        self.assertEqual(restored_image, image_path.resolve())
+
     def test_analysis_keeps_session_state_without_returning_credentials(self) -> None:
         credentials = {
             "api_key": "test-key",
@@ -17,9 +67,9 @@ class ReactWorkbenchTests(unittest.TestCase):
             "api_version": "test-version",
         }
         chunking = {
-            "technique": "heading_aware",
-            "chunk_size": 2600,
-            "overlap": 250,
+            "technique": "sentence",
+            "chunk_size": 512,
+            "overlap": 0,
             "min_sentences_per_chunk": 1,
             "semantic_threshold": 0.8,
         }
@@ -40,7 +90,20 @@ class ReactWorkbenchTests(unittest.TestCase):
             "parts": [],
         }
 
-        def fake_process(paths, output_dir, mode, text_documents=None):
+        processed_paths = []
+
+        def fake_process(
+            paths,
+            output_dir,
+            mode,
+            progress_callback=None,
+            text_documents=None,
+            object_types=None,
+        ):
+            processed_paths.extend(paths)
+            self.assertEqual(object_types, {"table"})
+            if progress_callback:
+                progress_callback("Analyzing sample.pdf page 2", 0.5)
             text_documents.append(document)
             return [], [object_record]
 
@@ -53,6 +116,7 @@ class ReactWorkbenchTests(unittest.TestCase):
             }]
 
         with tempfile.TemporaryDirectory() as temp_dir:
+            analysis_job = react_workbench.create_analysis_job()
             with (
                 patch.object(react_workbench, "_output_root", Path(temp_dir)),
                 patch.dict(react_workbench._sessions, {}, clear=True),
@@ -73,6 +137,8 @@ class ReactWorkbenchTests(unittest.TestCase):
                     "crop",
                     chunking,
                     credentials,
+                    ["table", "text"],
+                    analysis_job["job_id"],
                 )
                 configure.assert_called_once_with(
                     "test-key",
@@ -82,15 +148,151 @@ class ReactWorkbenchTests(unittest.TestCase):
                 )
 
         self.assertEqual(len(result["objects"]), 1)
+        self.assertTrue(result["text_enabled"])
         self.assertEqual(result["text_chunks"][0]["page_no"], 2)
         self.assertEqual(result["text_chunks"][0]["pages"], [2])
         self.assertNotIn("api_key", result)
+        self.assertEqual(processed_paths[0].name, "sample.pdf")
+        self.assertEqual(
+            react_workbench.get_analysis_progress(analysis_job["job_id"])["status"],
+            "complete",
+        )
+        self.assertEqual(
+            react_workbench.get_analysis_progress(analysis_job["job_id"])["progress"],
+            100,
+        )
+
+    def test_analysis_returns_only_selected_object_types(self) -> None:
+        credentials = {
+            "api_key": "test-key",
+            "endpoint": "https://example.test",
+            "deployment": "test-deployment",
+            "api_version": "test-version",
+        }
+        chunking = {
+            "technique": "sentence",
+            "chunk_size": 512,
+            "overlap": 0,
+            "min_sentences_per_chunk": 1,
+            "semantic_threshold": 0.8,
+        }
+        records = [
+            {
+                "object_id": "doc-1:page-1:image-1",
+                "doc_name": "sample.pdf",
+                "page_no": 1,
+                "object_type": "image",
+                "object_no": "image 1",
+                "parts": [],
+            },
+            {
+                "object_id": "doc-1:page-1:table-1",
+                "doc_name": "sample.pdf",
+                "page_no": 1,
+                "object_type": "table",
+                "object_no": "table 1",
+                "parts": [],
+            },
+            {
+                "object_id": "doc-1:page-1:graph-1",
+                "doc_name": "sample.pdf",
+                "page_no": 1,
+                "object_type": "graph",
+                "object_no": "graph 1",
+                "parts": [],
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(react_workbench, "_output_root", Path(temp_dir)),
+                patch.dict(react_workbench._sessions, {}, clear=True),
+                patch.object(react_workbench.custom_logic, "configure_azure_openai"),
+                patch.object(
+                    react_workbench.custom_logic,
+                    "process_pdf_files",
+                    return_value=([], records),
+                ) as process_files,
+                patch.object(react_workbench, "_chunk_documents", return_value=([], [])) as chunk_documents,
+            ):
+                result = react_workbench.analyze_pdfs(
+                    [("sample.pdf", b"%PDF-1.4 test")],
+                    "crop",
+                    chunking,
+                    credentials,
+                    ["image", "graph"],
+                )
+
+        self.assertEqual(
+            [item["object_type"] for item in result["objects"]],
+            ["image", "graph"],
+        )
+        self.assertEqual(process_files.call_args.kwargs["object_types"], {"image", "graph"})
+        self.assertIsNone(process_files.call_args.kwargs["text_documents"])
+        self.assertFalse(result["text_enabled"])
+        self.assertEqual(result["text_chunks"], [])
+        chunk_documents.assert_not_called()
+
+    def test_text_only_analysis_extracts_and_chunks_text_without_object_detection(self) -> None:
+        credentials = {
+            "api_key": "test-key",
+            "endpoint": "https://example.test",
+            "deployment": "test-deployment",
+            "api_version": "test-version",
+        }
+        chunking = {
+            "technique": "sentence",
+            "chunk_size": 512,
+            "overlap": 0,
+            "min_sentences_per_chunk": 1,
+            "semantic_threshold": 0.8,
+        }
+        document = {
+            "pdf_name": "sample.pdf",
+            "document_id": "doc-1",
+            "page_markdowns": [{"page_no": 1, "markdown": "Text body"}],
+        }
+
+        def fake_process(paths, output_dir, mode, text_documents=None, object_types=None):
+            self.assertEqual(object_types, set())
+            self.assertIsNotNone(text_documents)
+            text_documents.append(document)
+            return [], []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(react_workbench, "_output_root", Path(temp_dir)),
+                patch.dict(react_workbench._sessions, {}, clear=True),
+                patch.object(react_workbench.custom_logic, "configure_azure_openai"),
+                patch.object(
+                    react_workbench.custom_logic,
+                    "process_pdf_files",
+                    side_effect=fake_process,
+                ) as process_files,
+                patch.object(
+                    react_workbench,
+                    "_chunk_documents",
+                    return_value=([{"chunk_id": "doc-1:text:1"}], []),
+                ) as chunk_documents,
+            ):
+                result = react_workbench.analyze_pdfs(
+                    [("sample.pdf", b"%PDF-1.4 test")],
+                    "crop",
+                    chunking,
+                    credentials,
+                    ["text"],
+                )
+
+        self.assertEqual(process_files.call_args.kwargs["object_types"], set())
+        self.assertTrue(result["text_enabled"])
+        self.assertEqual(result["text_chunks"], [{"chunk_id": "doc-1:text:1"}])
+        chunk_documents.assert_called_once_with([document], chunking)
 
     def test_chunking_reports_extraction_errors_and_page_metadata(self) -> None:
         options = {
-            "technique": "heading_aware",
-            "chunk_size": 2600,
-            "overlap": 250,
+            "technique": "sentence",
+            "chunk_size": 512,
+            "overlap": 0,
             "min_sentences_per_chunk": 1,
             "semantic_threshold": 0.8,
         }

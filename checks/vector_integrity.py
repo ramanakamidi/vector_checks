@@ -5,6 +5,7 @@ Checks that every stored vector has the same dimensionality, which is
 required for meaningful nearest-neighbor comparisons.
 """
 
+import math
 from typing import Dict, List
 
 from connectors.base import VectorDBConnector
@@ -79,3 +80,93 @@ def run_all(
             field_mapper=field_mapper,
         )
     ]
+
+
+def check_retrieved_vectors_per_question(
+    connector: VectorDBConnector,
+    retrievals_by_question: List[Dict],
+) -> Dict:
+    """Check dimensions and basic vector validity for each question's retrieved records."""
+    question_results = []
+
+    for question_index, retrieval in enumerate(retrievals_by_question):
+        record_ids = list(dict.fromkeys(retrieval.get("retrieved_ids", [])))
+        dimensions_seen: Dict[int, int] = {}
+        record_results = []
+        unavailable_records = []
+        issues = []
+
+        for record_id in record_ids:
+            record = connector.fetch(record_id)
+            if record is None:
+                unavailable_records.append(str(record_id))
+                continue
+
+            vector = record.vector or []
+            dimension = len(vector)
+            dimensions_seen[dimension] = dimensions_seen.get(dimension, 0) + 1
+            record_issues = []
+            if not vector:
+                record_issues.append("Vector is empty.")
+            else:
+                try:
+                    vector_values = [float(value) for value in vector]
+                except (TypeError, ValueError, OverflowError):
+                    record_issues.append("Vector contains a non-numeric value.")
+                else:
+                    if not all(math.isfinite(value) for value in vector_values):
+                        record_issues.append("Vector contains a non-finite value.")
+                    elif not any(value != 0.0 for value in vector_values):
+                        record_issues.append("Vector has zero magnitude.")
+
+            record_result = {
+                "id": str(record_id),
+                "dimension": dimension,
+                "status": "FAIL" if record_issues else "PASS",
+                "issues": record_issues,
+            }
+            record_results.append(record_result)
+            if record_issues:
+                issues.extend(
+                    {"id": str(record_id), "reason": reason}
+                    for reason in record_issues
+                )
+
+        if len(dimensions_seen) > 1:
+            issues.append({
+                "reason": "Retrieved records have inconsistent vector dimensions."
+            })
+
+        passed = (
+            False if issues
+            else None if unavailable_records or not record_ids
+            else True
+        )
+        question_results.append({
+            "question_index": retrieval.get("question_index", question_index),
+            "question": retrieval.get("question", ""),
+            "retrieved_sources": retrieval.get("retrieved_sources", []),
+            "records_requested": len(record_ids),
+            "records_checked": len(record_results),
+            "dimensions_found": dimensions_seen,
+            "record_results": record_results,
+            "unavailable_records": unavailable_records,
+            "issues": issues,
+            "passed": passed,
+            "status": "PASS" if passed is True else "FAIL" if passed is False else "INFO",
+        })
+
+    overall_passed = (
+        False if any(item["passed"] is False for item in question_results)
+        else None if any(item["passed"] is None for item in question_results)
+        else True
+    )
+    return {
+        "check": "dimension_consistency_by_question",
+        "passed": overall_passed,
+        "detail": {
+            "records_per_question": 3,
+            "question_count": len(question_results),
+            "question_results": question_results,
+        },
+    }

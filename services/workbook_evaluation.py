@@ -21,6 +21,10 @@ REQUIRED_COLUMNS = {
 }
 
 
+class WorkbookEvaluationServiceError(RuntimeError):
+    """A shared AUT or judge service failure that prevents row evaluation."""
+
+
 def evaluate_workbook(
     workbook_bytes: bytes,
     project_id: str,
@@ -110,6 +114,11 @@ def evaluate_workbook(
             worksheet.cell(row=row, column=score_column).value = float(score)
             summary["passed" if status == "PASS" else "failed"] += 1
         except Exception as exc:
+            status_code = getattr(exc, "status_code", None)
+            if isinstance(status_code, int) and status_code >= 500:
+                raise WorkbookEvaluationServiceError(
+                    f"Workbook evaluation stopped at row {row}: {exc}"
+                ) from exc
             error_message = f"{type(exc).__name__}: {exc}"
             worksheet.cell(row=row, column=status_column).value = "ERROR"
             worksheet.cell(row=row, column=reason_column).value = error_message

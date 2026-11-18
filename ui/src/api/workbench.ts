@@ -6,7 +6,7 @@ export interface AzureCredentials {
 }
 
 export interface ChunkingOptions {
-  technique: 'heading_aware' | 'recursive' | 'sentence' | 'token' | 'semantic';
+  technique: 'recursive' | 'sentence' | 'token' | 'semantic';
   chunk_size: number;
   overlap: number;
   min_sentences_per_chunk: number;
@@ -41,10 +41,18 @@ export interface WorkbenchQA {
 export interface WorkbenchSession {
   session_id: string;
   objects: WorkbenchObject[];
+  text_enabled: boolean;
   text_chunks: Array<Record<string, unknown>>;
   text_errors: Array<{ pdf_name: string; error: string }>;
   chunking: ChunkingOptions;
   qa_records: WorkbenchQA[];
+}
+
+export interface WorkbenchAnalysisProgress {
+  job_id: string;
+  status: 'running' | 'complete' | 'failed';
+  progress: number;
+  message: string;
 }
 
 async function responseJson<T>(response: Response): Promise<T> {
@@ -66,20 +74,38 @@ async function responseJson<T>(response: Response): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+export async function createWorkbenchAnalysisJob(): Promise<WorkbenchAnalysisProgress> {
+  return responseJson<WorkbenchAnalysisProgress>(
+    await fetch('/api/workbench/analysis-jobs', { method: 'POST' }),
+  );
+}
+
+export async function getWorkbenchAnalysisProgress(
+  jobId: string,
+): Promise<WorkbenchAnalysisProgress> {
+  return responseJson<WorkbenchAnalysisProgress>(
+    await fetch(`/api/workbench/analysis-jobs/${encodeURIComponent(jobId)}`),
+  );
+}
+
 export async function analyzeWorkbench(
   files: File[],
   mode: string,
   chunking: ChunkingOptions,
+  objectTypes: string[],
   credentials: AzureCredentials,
+  jobId: string,
 ): Promise<WorkbenchSession> {
   const form = new FormData();
   files.forEach((file) => form.append('files', file));
+  form.append('job_id', jobId);
   form.append('mode', mode);
   form.append('technique', chunking.technique);
   form.append('chunk_size', String(chunking.chunk_size));
   form.append('overlap', String(chunking.overlap));
   form.append('min_sentences_per_chunk', String(chunking.min_sentences_per_chunk));
   form.append('semantic_threshold', String(chunking.semantic_threshold));
+  objectTypes.forEach((type) => form.append('object_types', type));
   Object.entries(credentials).forEach(([key, value]) => form.append(key, value));
   return responseJson<WorkbenchSession>(
     await fetch('/api/workbench/analyze', { method: 'POST', body: form }),

@@ -10,8 +10,6 @@ Modules:
   - neighbor_consistency: adjacent-chunk consistency checks
   - duplicate_detection: Category 3 — cosine-neighbor candidates for duplicate review
   - metadata_completeness: Category 4 — required field and value distribution checks
-  - index_health: stored vs indexed count, searchability, empty vectors
-
   - auto_pairs: Generate metadata-based candidate pairs (Phase 1)
   - llm_review: LLM-assisted pair review (Phase 2)
   - pair_runner: Run neighbor checks from reviewed Excel (Phase 3)

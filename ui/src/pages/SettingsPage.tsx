@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Settings, ChevronDown, ChevronRight, Save, Eye, EyeOff, Plus, Trash2, CheckCircle, AlertCircle, X, Loader2, Info } from 'lucide-react';
 import { useProject } from '../contexts/ProjectContext';
-import type { ProjectSettings, LLMConfig, AUTConfig, VectorStoreConfig, FieldMapperConfig } from '../api/types';
+import type { ProjectSettings, LLMConfig, AUTConfig, FieldMapperConfig } from '../api/types';
 import { getProjectSettings, saveProjectSettings, updateProject } from '../api/client';
 
 interface Toast { id: number; type: 'success' | 'error'; message: string; }
@@ -59,7 +59,6 @@ export default function SettingsPage() {
   const [savingProject, setSavingProject] = useState(false);
   const [savingLLM, setSavingLLM] = useState(false);
   const [savingAUT, setSavingAUT] = useState(false);
-  const [savingVS, setSavingVS] = useState(false);
   const [savingMeta, setSavingMeta] = useState(false);
   const [savingDoc, setSavingDoc] = useState(false);
 
@@ -79,8 +78,6 @@ export default function SettingsPage() {
   const [vsType, setVsType] = useState('chroma');
   const [vsDir, setVsDir] = useState('');
   const [vsCollection, setVsCollection] = useState('');
-  const [vsHost, setVsHost] = useState('');
-  const [vsPort, setVsPort] = useState('');
   const [metaFields, setMetaFields] = useState<MetadataField[]>([
     { field_name: 'doc_id', display_label: 'Document ID', include_in_report: true },
     { field_name: 'doc_name', display_label: 'Document Name', include_in_report: true },
@@ -106,7 +103,7 @@ export default function SettingsPage() {
       .then((s) => {
         if (s.llm_config) { setLlmApiKey(s.llm_config.api_key || ''); setLlmApiKeySet(s.llm_config.api_key_set || false); setLlmModel(s.llm_config.model || 'gpt-4'); }
         if (s.aut_config) { setAutUrl(s.aut_config.url || 'http://localhost:8000/mock-aut'); setAutMethod(s.aut_config.method || 'POST'); setAutEndpoint(s.aut_config.endpoint || '/ask'); setAutAnswerPath(s.aut_config.response_answer_path || 'answer'); setAutContextPath(s.aut_config.response_context_path || 'context'); setAutName((s.aut_config as any).name || ''); setAutType((s.aut_config as any).aut_type || 'rest_api'); }
-        if (s.vector_store_config) { setVsType(s.vector_store_config.db_type || 'chroma'); setVsDir(s.vector_store_config.persist_directory || ''); setVsCollection(s.vector_store_config.collection_name || ''); setVsHost((s.vector_store_config as any).host || ''); setVsPort((s.vector_store_config as any).port || ''); }
+        if (s.vector_store_config) { setVsType(s.vector_store_config.db_type || 'chroma'); setVsDir(s.vector_store_config.persist_directory || ''); setVsCollection(s.vector_store_config.collection_name || ''); }
         if (s.field_mapper) {
           const custom: MetadataField[] = (s.field_mapper as any).custom_metadata_fields || [];
           if (custom.length > 0) { setMetaFields(custom); }
@@ -149,18 +146,6 @@ export default function SettingsPage() {
       await saveProjectSettings(activeProject.id, { aut_config: { name: autName, aut_type: autType, url: autUrl, method: autMethod, endpoint: autEndpoint, headers: {}, request_template: { question: '{{query}}' }, response_answer_path: autAnswerPath, response_context_path: autContextPath } as any });
       toast('success', 'AUT configuration saved');
     } catch (e: any) { toast('error', e.message); } finally { setSavingAUT(false); }
-  };
-
-  const saveVS = async () => {
-    if (!activeProject) return;
-    setSavingVS(true);
-    try {
-      const cfg: any = { db_type: vsType, persist_directory: vsDir, collection_name: vsCollection };
-      if (vsHost) cfg.host = vsHost;
-      if (vsPort) cfg.port = vsPort;
-      await saveProjectSettings(activeProject.id, { vector_store_config: cfg });
-      toast('success', 'Vector store configuration saved');
-    } catch (e: any) { toast('error', e.message); } finally { setSavingVS(false); }
   };
 
   const saveMeta = async () => {
@@ -312,43 +297,30 @@ export default function SettingsPage() {
         </Card>
 
         {/* Vector Store Configuration */}
-        <Card title="Vector Store Configuration" subtitle="Database type, collection, and connection settings">
+        <Card title="Vector Store Configuration" subtitle="Selected when the project is created">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <label className={lc}>Vector Store Type</label>
-              <select value={vsType} onChange={(e) => setVsType(e.target.value)} className={sc}>
+              <select value={vsType} disabled className={`${sc} disabled:bg-slate-100 disabled:text-slate-500`}>
                 <option value="chroma">Chroma</option>
-                <option value="elasticsearch">Elasticsearch</option>
-                <option value="pinecone">Pinecone</option>
-                <option value="weaviate">Weaviate</option>
-                <option value="milvus">Milvus</option>
-                <option value="pgvector">PGVector</option>
+                <option value="faiss">FAISS (local)</option>
+                <option value="milvus_lite">Milvus Lite (local file)</option>
               </select>
             </div>
             <div>
               <label className={lc}>Collection Name</label>
-              <input type="text" value={vsCollection} onChange={(e) => setVsCollection(e.target.value)} className={ic} placeholder="my_collection" />
+              <input type="text" value={vsCollection} readOnly className={`${ic} bg-slate-100 text-slate-500`} />
             </div>
-            {vsType === 'chroma' && (
+            {(vsType === 'chroma' || vsType === 'faiss' || vsType === 'milvus_lite') && (
               <div className="md:col-span-2">
-                <label className={lc}>Persist Directory</label>
-                <input type="text" value={vsDir} onChange={(e) => setVsDir(e.target.value)} className={ic} placeholder="./projects/proj_id/chroma_data" />
+                <label className={lc}>{vsType === 'milvus_lite' ? 'Database Path' : 'Storage Directory'}</label>
+                <input type="text" value={vsDir} readOnly className={`${ic} bg-slate-100 text-slate-500`} />
               </div>
             )}
-            {vsType !== 'chroma' && (
-              <>
-                <div>
-                  <label className={lc}>Host</label>
-                  <input type="text" value={vsHost} onChange={(e) => setVsHost(e.target.value)} className={ic} placeholder="localhost" />
-                </div>
-                <div>
-                  <label className={lc}>Port</label>
-                  <input type="text" value={vsPort} onChange={(e) => setVsPort(e.target.value)} className={ic} placeholder="9200" />
-                </div>
-              </>
-            )}
           </div>
-          <div className="flex justify-end mt-4"><SBtn onClick={saveVS} saving={savingVS} /></div>
+          <p className="mt-3 text-xs text-slate-500">
+            To use a different vector database, create a new project and choose it there.
+          </p>
         </Card>
 
         {/* Metadata Field Mapping */}

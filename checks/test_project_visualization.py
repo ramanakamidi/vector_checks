@@ -37,18 +37,47 @@ class ProjectVisualizationTests(unittest.TestCase):
         }
 
         hdbscan = Mock()
-        hdbscan.fit_predict.return_value = np.asarray([0, 0, -1])
+        thread_counts = []
+
+        def capture_thread_count():
+            from threadpoolctl import threadpool_info
+
+            thread_counts.append(
+                [pool["num_threads"] for pool in threadpool_info()]
+            )
+
+        def fit_predict(_projected_coordinates):
+            capture_thread_count()
+            return np.asarray([0, 0, -1])
+
+        hdbscan.fit_predict.side_effect = fit_predict
+
+        def create_projector(**_kwargs):
+            projector = Mock()
+
+            def fit_transform(_vectors):
+                capture_thread_count()
+                return coordinates
+
+            projector.fit_transform.side_effect = fit_transform
+            return projector
+
         with (
             patch(
                 "services.project_chroma.open_project_collection",
                 return_value=collection,
             ),
-            patch("umap.UMAP") as umap,
+            patch("umap.UMAP", side_effect=create_projector),
             patch("sklearn.cluster.HDBSCAN", return_value=hdbscan),
         ):
-            umap.return_value.fit_transform.return_value = coordinates
             result = build_project_visualization("project-1")
 
+        self.assertTrue(thread_counts)
+        observed_counts = [
+            count for counts in thread_counts for count in counts
+        ]
+        self.assertTrue(observed_counts)
+        self.assertEqual(max(observed_counts), 1)
         np.testing.assert_array_equal(
             hdbscan.fit_predict.call_args.args[0],
             coordinates,

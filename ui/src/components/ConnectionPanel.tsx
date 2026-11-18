@@ -8,7 +8,7 @@ interface Props {
   loading: boolean;
 }
 
-const DB_TYPES = ['chroma', 'pinecone', 'weaviate', 'elastic', 'milvus', 'pgvector'] as const;
+const DB_TYPES = ['chroma', 'faiss', 'milvus_lite', 'pinecone', 'weaviate', 'elastic', 'milvus', 'pgvector'] as const;
 
 interface FieldDef {
   key: string;
@@ -21,6 +21,14 @@ const DB_FIELDS: Record<string, FieldDef[]> = {
   chroma: [
     { key: 'collection_name', label: 'Collection Name', placeholder: 'my_collection' },
     { key: 'persist_directory', label: 'Persist Directory', placeholder: './chroma_data' },
+  ],
+  faiss: [
+    { key: 'collection_name', label: 'Collection Name', placeholder: 'my_collection' },
+    { key: 'persist_directory', label: 'Persist Directory', placeholder: './faiss_data' },
+  ],
+  milvus_lite: [
+    { key: 'collection_name', label: 'Collection Name', placeholder: 'my_collection' },
+    { key: 'persist_directory', label: 'Database Path', placeholder: './milvus_demo.db' },
   ],
   pinecone: [
     { key: 'api_key', label: 'API Key', placeholder: 'pk-...', type: 'password' },
@@ -116,7 +124,9 @@ export default function ConnectionPanel({ connected, onConnected, onRunChecks, l
             >
               {DB_TYPES.map((t) => (
                 <option key={t} value={t}>
-                  {t.charAt(0).toUpperCase() + t.slice(1)}
+                  {t === 'milvus_lite'
+                    ? 'Milvus Lite (local)'
+                    : t.charAt(0).toUpperCase() + t.slice(1)}
                 </option>
               ))}
             </select>

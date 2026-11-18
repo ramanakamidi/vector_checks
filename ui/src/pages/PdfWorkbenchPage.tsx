@@ -1,25 +1,49 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Download, FileSearch, LoaderCircle, RefreshCw, Sparkles } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Download, FileSearch, LoaderCircle, RefreshCw, Sparkles, X } from 'lucide-react';
 import AzureCredentialFields from '../components/AzureCredentialFields';
 import {
   analyzeWorkbench,
+  createWorkbenchAnalysisJob,
   downloadBase64File,
   generateWorkbenchQA,
-  getWorkbenchSession,
+  getWorkbenchAnalysisProgress,
   getWorkbenchWorkbook,
   updateWorkbenchChunking,
 } from '../api/workbench';
-import type { ChunkingOptions, WorkbenchObject, WorkbenchSession } from '../api/workbench';
-import { hasAzureCredentials, useAzureCredentials } from '../contexts/AzureCredentialsContext';
+import type {
+  ChunkingOptions,
+  WorkbenchAnalysisProgress,
+  WorkbenchObject,
+} from '../api/workbench';
+import { hasAzureCredentials } from '../contexts/AzureCredentialsContext';
+import { usePdfWorkbench } from '../contexts/PdfWorkbenchContext';
+import type { ObjectType } from '../contexts/PdfWorkbenchContext';
 
-const SESSION_KEY = 'react_pdf_workbench_session';
 const DEFAULT_CHUNKING: ChunkingOptions = {
-  technique: 'heading_aware',
-  chunk_size: 2600,
-  overlap: 250,
+  technique: 'sentence',
+  chunk_size: 512,
+  overlap: 0,
   min_sentences_per_chunk: 1,
   semantic_threshold: 0.8,
 };
+const SUPPORTED_CHUNKING_TECHNIQUES: ChunkingOptions['technique'][] = [
+  'recursive',
+  'sentence',
+  'token',
+  'semantic',
+];
+const OBJECT_TYPES: ObjectType[] = ['table', 'image', 'graph'];
+const SELECTABLE_TYPES: ObjectType[] = [...OBJECT_TYPES, 'text'];
+
+function normalizeChunking(chunking: ChunkingOptions | undefined): ChunkingOptions {
+  return chunking && SUPPORTED_CHUNKING_TECHNIQUES.includes(chunking.technique)
+    ? chunking
+    : DEFAULT_CHUNKING;
+}
+
+function isObjectType(value: string): value is ObjectType {
+  return OBJECT_TYPES.some((type) => type === value);
+}
 
 function objectSummary(item: WorkbenchObject): string {
   const details = item.characteristics;
@@ -27,53 +51,87 @@ function objectSummary(item: WorkbenchObject): string {
 }
 
 export default function PdfWorkbenchPage() {
-  const { credentials } = useAzureCredentials();
-  const [session, setSession] = useState<WorkbenchSession | null>(null);
+  const {
+    generationCredentials,
+    setGenerationCredentials,
+    session,
+    setSession,
+    selectedIds,
+    setSelectedIds,
+    selectedObjectTypes,
+    setSelectedObjectTypes,
+  } = usePdfWorkbench();
+  const [previewObject, setPreviewObject] = useState<WorkbenchObject | null>(null);
   const [files, setFiles] = useState<File[]>([]);
   const [mode, setMode] = useState('crop');
   const [chunking, setChunking] = useState(DEFAULT_CHUNKING);
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const [generateObjects, setGenerateObjects] = useState(true);
-  const [generateText, setGenerateText] = useState(true);
   const [objectCount, setObjectCount] = useState(5);
   const [textCount, setTextCount] = useState(2);
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [analysisProgress, setAnalysisProgress] = useState<WorkbenchAnalysisProgress | null>(null);
+  const activeSessionIdRef = useRef<string | null>(null);
 
   useEffect(() => {
-    const savedId = sessionStorage.getItem(SESSION_KEY);
-    if (!savedId) return;
-    getWorkbenchSession(savedId)
-      .then((current) => {
-        setSession(current);
-        setChunking(current.chunking);
-        setSelectedIds([]);
-      })
-      .catch((cause) => {
-        sessionStorage.removeItem(SESSION_KEY);
-        setError(
-          cause instanceof Error
-            ? `Could not restore the previous Workbench session: ${cause.message}`
-            : 'Could not restore the previous Workbench session.',
-        );
-      });
-  }, []);
+    if (!previewObject) return undefined;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setPreviewObject(null);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [previewObject]);
+
+  useEffect(() => {
+    const sessionId = session?.session_id ?? null;
+    if (activeSessionIdRef.current === sessionId) return;
+    activeSessionIdRef.current = sessionId;
+    setChunking(normalizeChunking(session?.chunking));
+  }, [session]);
 
   const hasPendingChunking = useMemo(
     () => session !== null && JSON.stringify(chunking) !== JSON.stringify(session.chunking),
     [chunking, session],
   );
-  const supportsOverlap = chunking.technique === 'heading_aware'
-    || chunking.technique === 'sentence'
+  const supportsOverlap = chunking.technique === 'sentence'
     || chunking.technique === 'token';
+  const minimumChunkSize = 64;
+  const validChunking = Number.isInteger(chunking.chunk_size)
+    && chunking.chunk_size >= minimumChunkSize
+    && chunking.chunk_size <= 8000
+    && (!supportsOverlap || (
+      Number.isInteger(chunking.overlap)
+      && chunking.overlap >= 0
+      && chunking.overlap <= 4096
+      && chunking.overlap < chunking.chunk_size
+    ))
+    && (chunking.technique !== 'sentence'
+      || (Number.isInteger(chunking.min_sentences_per_chunk)
+        && chunking.min_sentences_per_chunk >= 1
+        && chunking.min_sentences_per_chunk <= 20))
+    && (chunking.technique !== 'semantic'
+      || (chunking.semantic_threshold >= 0.05 && chunking.semantic_threshold <= 0.95));
+  const validQuestionCounts = (!selectedIds.length || (
+    Number.isInteger(objectCount)
+    && objectCount >= 1
+    && objectCount <= 20
+  ))
+    && Number.isInteger(textCount)
+    && textCount >= 1
+    && textCount <= 3;
+  const visibleObjects = session?.objects.filter(
+    (item) => isObjectType(item.object_type) && selectedObjectTypes.includes(item.object_type),
+  ) ?? [];
+  const textSelected = selectedObjectTypes.includes('text');
+  const sessionHasText = Boolean(session?.text_enabled);
+  const canGenerateText = textSelected && sessionHasText;
 
   const setTechnique = (technique: ChunkingOptions['technique']) => {
     setChunking({
       ...DEFAULT_CHUNKING,
       technique,
-      chunk_size: technique === 'heading_aware' ? 2600 : 512,
-      overlap: technique === 'heading_aware' ? 250 : 50,
+      chunk_size: 512,
+      overlap: 0,
     });
   };
 
@@ -81,15 +139,60 @@ export default function PdfWorkbenchPage() {
     setBusy('analysis');
     setError('');
     setNotice('');
+    setAnalysisProgress(null);
+    let stopPolling = false;
+    let progressTask: Promise<void> | null = null;
     try {
-      const current = await analyzeWorkbench(files, mode, chunking, credentials);
+      const job = await createWorkbenchAnalysisJob();
+      setAnalysisProgress(job);
+      progressTask = (async () => {
+        while (!stopPolling) {
+          await new Promise((resolve) => window.setTimeout(resolve, 700));
+          if (stopPolling) return;
+          try {
+            const progress = await getWorkbenchAnalysisProgress(job.job_id);
+            if (stopPolling) return;
+            setAnalysisProgress(progress);
+            if (progress.status !== 'running') return;
+          } catch (cause) {
+            if (!stopPolling) {
+              const details = cause instanceof Error ? ` (${cause.message})` : '';
+              setAnalysisProgress((current) => current && ({
+                ...current,
+                message: `Progress updates are unavailable${details}. Analysis is still running.`,
+              }));
+            }
+            return;
+          }
+        }
+      })();
+      const current = await analyzeWorkbench(
+        files,
+        mode,
+        chunking,
+        selectedObjectTypes,
+        generationCredentials,
+        job.job_id,
+      );
       setSession(current);
-      sessionStorage.setItem(SESSION_KEY, current.session_id);
       setSelectedIds([]);
+      setAnalysisProgress({
+        ...job,
+        status: 'complete',
+        progress: 100,
+        message: `Analysis complete: ${current.objects.length} objects and ${current.text_chunks.length} text chunks.`,
+      });
       setNotice(`Analysis complete: ${current.objects.length} objects and ${current.text_chunks.length} text chunks.`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'PDF analysis failed.');
+      setAnalysisProgress((current) => current && ({
+        ...current,
+        status: 'failed',
+        message: 'Analysis failed. See the error message above.',
+      }));
     } finally {
+      stopPolling = true;
+      if (progressTask) await progressTask;
       setBusy('');
     }
   };
@@ -118,11 +221,11 @@ export default function PdfWorkbenchPage() {
     try {
       const current = await generateWorkbenchQA(session.session_id, {
         object_ids: selectedIds,
-        generate_objects: generateObjects,
-        generate_text: generateText,
+        generate_objects: selectedIds.length > 0,
+        generate_text: canGenerateText,
         object_question_count: objectCount,
         text_question_count: textCount,
-        ...credentials,
+        ...generationCredentials,
       });
       setSession(current);
       setNotice(`Q&A generated: ${current.qa_records.length} question-and-answer pairs.`);
@@ -155,12 +258,27 @@ export default function PdfWorkbenchPage() {
     ));
   };
 
+  const toggleObjectType = (type: ObjectType) => {
+    const nextTypes = selectedObjectTypes.includes(type)
+      ? selectedObjectTypes.filter((value) => value !== type)
+      : [...selectedObjectTypes, type];
+    setSelectedObjectTypes(nextTypes);
+    if (session) {
+      const visibleIds = new Set(
+        session.objects
+          .filter((item) => isObjectType(item.object_type) && nextTypes.includes(item.object_type))
+          .map((item) => item.object_id),
+      );
+      setSelectedIds((current) => current.filter((id) => visibleIds.has(id)));
+    }
+  };
+
   return (
     <div className="space-y-6">
       <header className="page-heading">
         <div>
           <p className="eyebrow">Document intelligence</p>
-          <h1>PDF Workbench</h1>
+          <h1>Test Data Generation</h1>
           <p>Analyze PDF figures and prose, select objects inline, and create a linked Q&amp;A workbook.</p>
         </div>
         {session && (
@@ -188,99 +306,236 @@ export default function PdfWorkbenchPage() {
             <span className="text-sm text-slate-500">PDF only · Up to 10 files / 100 MB total</span>
           </label>
           <div className="space-y-4">
-            <label className="field-label">Vision context
+            <fieldset className="field-label border-0 p-0">
+              <legend className="mb-2">Object types to detect</legend>
+              <div className="object-type-filters" aria-label="Object types to detect">
+                {SELECTABLE_TYPES.map((type) => (
+                  <label className="check-label" key={type}>
+                    <input
+                      type="checkbox"
+                      checked={selectedObjectTypes.includes(type)}
+                      onChange={() => toggleObjectType(type)}
+                    />
+                    <span>{type === 'image' ? 'Image' : type === 'graph' ? 'Graph' : type === 'text' ? 'Text' : 'Table'}</span>
+                  </label>
+                ))}
+              </div>
+              {!selectedObjectTypes.length && (
+                <span className="field-help">Select at least one object type before analyzing.</span>
+              )}
+            </fieldset>
+            <label className="field-label">Crop mode
               <select value={mode} onChange={(event) => setMode(event.target.value)}>
                 <option value="crop">Object crop</option>
                 <option value="page">Crop + full page</option>
                 <option value="page_context">Crop + neighboring pages</option>
               </select>
             </label>
-            <label className="field-label">Text chunking technique
-              <select value={chunking.technique} onChange={(event) => setTechnique(event.target.value as ChunkingOptions['technique'])}>
-                <option value="heading_aware">Heading-aware</option>
-                <option value="recursive">Recursive</option>
-                <option value="sentence">Sentence</option>
-                <option value="token">Token</option>
-                <option value="semantic">Semantic</option>
-              </select>
-            </label>
+            {textSelected && (
+              <label className="field-label">Text chunking technique
+                <select value={chunking.technique} onChange={(event) => setTechnique(event.target.value as ChunkingOptions['technique'])}>
+                  <option value="recursive">Recursive</option>
+                  <option value="sentence">Sentence</option>
+                  <option value="token">Token</option>
+                  <option value="semantic">Semantic</option>
+                </select>
+              </label>
+            )}
           </div>
         </div>
 
+        {textSelected && (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <label className="field-label">{chunking.technique === 'heading_aware' ? 'Max characters' : 'Max tokens'}
-            <input type="number" min={64} max={12000} value={chunking.chunk_size}
-              onChange={(event) => setChunking({ ...chunking, chunk_size: Number(event.target.value) })} />
+          <label className="field-label">Max tokens
+            <input type="number" min={minimumChunkSize} max={8000} value={chunking.chunk_size}
+              onChange={(event) => {
+                const chunkSize = Number(event.target.value);
+                setChunking({
+                  ...chunking,
+                  chunk_size: chunkSize,
+                  overlap: supportsOverlap
+                    ? Math.max(0, Math.min(chunking.overlap, chunkSize - 1))
+                    : chunking.overlap,
+                });
+              }} />
           </label>
           {supportsOverlap && <label className="field-label">Overlap
-            <input type="number" min={0} max={4096} value={chunking.overlap}
+            <input type="number" min={0} max={Math.min(4096, chunking.chunk_size - 1)} value={chunking.overlap}
               onChange={(event) => setChunking({ ...chunking, overlap: Number(event.target.value) })} />
           </label>}
           {chunking.technique === 'sentence' && <label className="field-label">Minimum sentences
             <input type="number" min={1} max={20} value={chunking.min_sentences_per_chunk}
               onChange={(event) => setChunking({ ...chunking, min_sentences_per_chunk: Number(event.target.value) })} />
+            <span className="field-help">Best-effort; short text or the token limit may yield fewer sentences.</span>
           </label>}
           {chunking.technique === 'semantic' && <label className="field-label">Semantic threshold
             <input type="number" min={0.05} max={0.95} step={0.05} value={chunking.semantic_threshold}
               onChange={(event) => setChunking({ ...chunking, semantic_threshold: Number(event.target.value) })} />
           </label>}
-        </div>
+        </div>)}
         <details className="credential-disclosure">
-          <summary>Azure OpenAI credentials <span>Required for analysis and Q&amp;A; kept in memory only</span></summary>
-          <div className="pt-4"><AzureCredentialFields /></div>
+          <summary>Azure OpenAI credentials <span>For this tab only; kept in memory only</span></summary>
+          <div className="pt-4"><AzureCredentialFields credentials={generationCredentials} onChange={setGenerationCredentials} /></div>
         </details>
         <div className="flex flex-wrap gap-3">
-          <button className="button-primary" onClick={runAnalysis} disabled={!files.length || !hasAzureCredentials(credentials) || !!busy}>
+          <button className="button-primary" onClick={runAnalysis} disabled={!files.length || !selectedObjectTypes.length || (textSelected && !validChunking) || !hasAzureCredentials(generationCredentials) || !!busy}>
             {busy === 'analysis' ? <LoaderCircle className="animate-spin" size={16} /> : <Sparkles size={16} />}
             {busy === 'analysis' ? 'Analyzing PDFs…' : 'Analyze PDFs'}
           </button>
-          {session && (
-            <button className="button-secondary" onClick={applyChunking} disabled={!hasPendingChunking || !!busy}>
+          {session && canGenerateText && (
+            <button className="button-secondary" onClick={applyChunking} disabled={!hasPendingChunking || !validChunking || !!busy}>
               {busy === 'chunking' ? <LoaderCircle className="animate-spin" size={16} /> : <RefreshCw size={16} />}
               Apply chunking settings
             </button>
           )}
         </div>
+        {busy === 'analysis' && analysisProgress && (
+          <div className="workbench-progress-card" role="status" aria-live="polite">
+            <div className="workbench-progress-icon">
+              <FileSearch size={22} />
+            </div>
+            <div className="workbench-progress-content">
+              <div className="workbench-progress-heading">
+                <div>
+                  <p className="workbench-progress-eyebrow">Document analysis</p>
+                  <p className="workbench-progress-message">{analysisProgress.message}</p>
+                </div>
+                <strong>{analysisProgress.progress}%</strong>
+              </div>
+              <div
+                className="workbench-progress-track"
+                role="progressbar"
+                aria-label="PDF analysis progress"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={analysisProgress.progress}
+              >
+                <span style={{ width: `${analysisProgress.progress}%` }} />
+              </div>
+              <div className="workbench-progress-footer">
+                <span>{files.length} PDF{files.length === 1 ? '' : 's'} in this run</span>
+                <span>Large documents may take a little longer</span>
+              </div>
+            </div>
+          </div>
+        )}
       </section>
 
       {error && <div className="alert-error" role="alert">{error}</div>}
       {notice && <div className="alert-success" role="status">{notice}</div>}
+      {textSelected && !validChunking && <div className="alert-warning" role="alert">Chunk settings must be valid; overlap must be smaller than the chunk size.</div>}
 
       {session && (
         <>
-          {session.text_errors.length > 0 && (
+          {canGenerateText && session.text_errors.length > 0 && (
             <div className="alert-error">
               {session.text_errors.map((item) => <p key={item.pdf_name}>{item.pdf_name}: {item.error}</p>)}
             </div>
           )}
           <section className="panel">
             <div className="section-title">
-              <div><h2>Detected objects</h2><p>Choose objects directly from this list for object Q&amp;A.</p></div>
+              <div><h2>Detected objects</h2><p>Only the object types selected before analysis are shown. Select objects for Q&amp;A.</p></div>
               <span className="status-pill">{selectedIds.length} selected</span>
             </div>
-            {session.objects.length === 0 ? (
+            {visibleObjects.length === 0 ? (
               <p className="empty-state">No figures, tables, or images were detected in this analysis.</p>
             ) : (
               <div className="object-grid">
-                {session.objects.map((item) => (
-                  <label className={`object-card ${selectedIds.includes(item.object_id) ? 'object-card-selected' : ''}`} key={item.object_id}>
-                    <input type="checkbox" checked={selectedIds.includes(item.object_id)} onChange={() => toggleObject(item.object_id)} />
-                    {item.image_urls[0] && <img src={item.image_urls[0]} alt={`${item.object_type} on page ${item.page_no}`} />}
+                {visibleObjects.map((item) => (
+                  <article className={`object-card ${selectedIds.includes(item.object_id) ? 'object-card-selected' : ''}`} key={item.object_id}>
+                    <input id={`object-${item.object_id}`} type="checkbox" checked={selectedIds.includes(item.object_id)} onChange={() => toggleObject(item.object_id)} />
+                    {item.image_urls[0] && (
+                      <button
+                        type="button"
+                        className="object-image-button"
+                        aria-label={`View ${item.object_no || item.object_type} image and details`}
+                        onClick={() => setPreviewObject(item)}
+                      >
+                        <img src={item.image_urls[0]} alt={`${item.object_type} on page ${item.page_no}`} />
+                      </button>
+                    )}
                     <div className="min-w-0">
                       <div className="flex justify-between gap-2">
-                        <strong>{item.object_no || item.object_type}</strong>
+                        <label htmlFor={`object-${item.object_id}`}><strong>{item.object_no || item.object_type}</strong></label>
                         <span className="status-pill">{item.object_type}</span>
                       </div>
                       <p className="text-xs text-slate-500">{item.pdf_name} · Page {item.page_no}</p>
                       <p className="object-summary">{objectSummary(item)}</p>
                     </div>
-                  </label>
+                  </article>
                 ))}
               </div>
             )}
           </section>
 
-          <section className="panel space-y-4">
+          {previewObject && (
+            <div className="object-preview-backdrop" onClick={() => setPreviewObject(null)}>
+              <section
+                className="object-preview-dialog"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="object-preview-title"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <header className="object-preview-header">
+                  <div>
+                    <p className="eyebrow">Detected object</p>
+                    <h2 id="object-preview-title">{previewObject.object_no || previewObject.object_type}</h2>
+                  </div>
+                  <button
+                    type="button"
+                    className="object-preview-close"
+                    aria-label="Close object preview"
+                    onClick={() => setPreviewObject(null)}
+                  >
+                    <X size={20} />
+                  </button>
+                </header>
+                {previewObject.image_urls[0] && (
+                  <div className="object-preview-image-wrap">
+                    <img
+                      src={previewObject.image_urls[0]}
+                      alt={`${previewObject.object_type} from ${previewObject.pdf_name}, page ${previewObject.page_no}`}
+                    />
+                  </div>
+                )}
+                <div className="object-preview-information">
+                  <div className="object-preview-metadata">
+                    <span><strong>Type</strong>{previewObject.object_type}</span>
+                    <span><strong>PDF</strong>{previewObject.pdf_name}</span>
+                    <span><strong>Page</strong>{previewObject.page_no}</span>
+                    {previewObject.position && <span><strong>Position</strong>{previewObject.position}</span>}
+                    {previewObject.title && <span><strong>Title</strong>{previewObject.title}</span>}
+                  </div>
+                  <div>
+                    <h3>Summary</h3>
+                    <p>{objectSummary(previewObject)}</p>
+                  </div>
+                  {Object.keys(previewObject.characteristics).length > 0 && (
+                    <div>
+                      <h3>Additional information</h3>
+                      <dl className="object-preview-characteristics">
+                        {Object.entries(previewObject.characteristics).map(([key, value]) => (
+                          <div key={key}>
+                            <dt>{key.replace(/_/g, ' ')}</dt>
+                            <dd>{typeof value === 'string' ? value : JSON.stringify(value)}</dd>
+                          </div>
+                        ))}
+                      </dl>
+                    </div>
+                  )}
+                </div>
+              </section>
+            </div>
+          )}
+
+          {textSelected && !sessionHasText && (
+            <p className="alert-warning" role="status">
+              Text was not selected when this analysis ran. Select Text before analyzing to extract, chunk, and generate text Q&amp;A.
+            </p>
+          )}
+
+          {canGenerateText && <section className="panel space-y-4">
             <div className="section-title"><div><h2>Text chunk preview</h2><p>{session.text_chunks.length} extracted prose chunks. Apply new settings without analyzing PDFs again.</p></div></div>
             <div className="grid gap-3 md:grid-cols-2">
               {session.text_chunks.slice(0, 4).map((chunk, index) => (
@@ -290,28 +545,32 @@ export default function PdfWorkbenchPage() {
                     <span className="text-xs text-slate-500">Page {String(chunk.page_no ?? '—')}</span>
                   </div>
                   <p>{String(chunk.source_text ?? '')}</p>
+                  {String(chunk.source_text ?? '').length > 320 && (
+                    <details className="chunk-preview-details">
+                      <summary>Show full chunk</summary>
+                      <p>{String(chunk.source_text ?? '')}</p>
+                    </details>
+                  )}
                 </article>
               ))}
             </div>
-          </section>
+          </section>}
 
           <section className="panel space-y-4">
-            <div className="section-title"><div className="icon-tile"><Sparkles size={18} /></div><div><h2>Generate Q&amp;A</h2><p>Object Q&amp;A uses checked objects; text Q&amp;A uses all chunks.</p></div></div>
+            <div className="section-title"><div className="icon-tile"><Sparkles size={18} /></div><div><h2>Generate Q&amp;A</h2><p>Generate Q&amp;A for checked objects{canGenerateText ? ' and extracted text chunks' : ''}.</p></div></div>
             <div className="flex flex-wrap gap-x-6 gap-y-3">
-              <label className="check-label"><input type="checkbox" checked={generateObjects} onChange={(event) => setGenerateObjects(event.target.checked)} /> Objects</label>
-              <label className="check-label"><input type="checkbox" checked={generateText} onChange={(event) => setGenerateText(event.target.checked)} /> Document text</label>
-              <label className="field-label compact-field">Questions per object
-                <input type="number" min={1} max={20} value={objectCount} onChange={(event) => setObjectCount(Number(event.target.value))} />
-              </label>
-              <label className="field-label compact-field">Questions per text chunk
-                <input type="number" min={1} max={3} value={textCount} onChange={(event) => setTextCount(Number(event.target.value))} />
-              </label>
+              {selectedIds.length > 0 && <label className="field-label compact-field">Questions per selected object
+                <input type="number" min={1} max={20} step={1} value={objectCount} onChange={(event) => setObjectCount(Number(event.target.value))} />
+              </label>}
+              {canGenerateText && <label className="field-label compact-field">Questions per text chunk
+                <input type="number" min={1} max={3} step={1} value={textCount} onChange={(event) => setTextCount(Number(event.target.value))} />
+              </label>}
             </div>
-            {hasPendingChunking && <p className="alert-warning">Apply the changed chunk settings before generating text Q&amp;A.</p>}
+            {canGenerateText && hasPendingChunking && <p className="alert-warning">Apply the changed chunk settings before generating text Q&amp;A.</p>}
             <button className="button-primary" onClick={runGeneration}
-              disabled={!hasAzureCredentials(credentials) || !!busy || (!generateObjects && !generateText) || (generateObjects && !selectedIds.length) || (generateText && (!session.text_chunks.length || hasPendingChunking))}>
+              disabled={!hasAzureCredentials(generationCredentials) || !validQuestionCounts || !!busy || (!selectedIds.length && !canGenerateText) || (canGenerateText && session.text_chunks.length > 0 && hasPendingChunking)}>
               {busy === 'qa' ? <LoaderCircle className="animate-spin" size={16} /> : <Sparkles size={16} />}
-              {busy === 'qa' ? 'Generating Q&A…' : 'Generate selected Q&A'}
+              {busy === 'qa' ? 'Generating Q&A…' : 'Generate Q&A'}
             </button>
             {session.qa_records.length > 0 && (
               <div className="overflow-x-auto">

@@ -28,7 +28,10 @@ import uuid
 import socket
 import urllib.error
 import urllib.request
+import threading
+import time
 from dataclasses import asdict
+from itertools import islice
 from pathlib import Path
 
 # Ensure the project root is importable regardless of cwd
@@ -37,7 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fastapi import FastAPI, HTTPException, Query, Body, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr, ValidationError
 from starlette.concurrency import run_in_threadpool
 from typing import Any, Dict, List, Literal, Optional
 
@@ -47,11 +50,12 @@ from config import FieldMapper, ReportConfig
 from run_checks import run_full_report
 from checks.negative_queries import DEFAULT_MAX_SIMILARITY
 from report.html_report import generate_report
-from services.pdf_ingestion import ingest_pdf
+from services.pdf_ingestion import MAX_INGESTION_CHUNK_SIZE, ingest_pdf
 from services.project_vector_checks import CHECK_CATEGORIES, run_project_checks
 from services.project_visualization import build_project_visualization
-from services.project_chroma import open_project_collection
+from services.project_chroma import default_storage_location, open_project_collection
 from services import react_workbench
+from services.workbook_evaluation import WorkbookEvaluationServiceError
 
 # ── App setup ─────────────────────────────────────────────────────────
 
@@ -60,6 +64,9 @@ app = FastAPI(
     description="REST API for running vector-database health checks",
     version="1.0.0",
 )
+
+PDF_INGESTION_JOBS: Dict[str, Dict[str, Any]] = {}
+PDF_INGESTION_JOBS_LOCK = threading.RLock()
 
 app.add_middleware(
     CORSMiddleware,
@@ -73,6 +80,7 @@ app.add_middleware(
 
 _state: Dict[str, Any] = {
     "connector": None,
+    "db_type": None,
     "field_mapper": FieldMapper(),
     "results": None,
     "fault_annotations": {},
@@ -132,8 +140,8 @@ class WorkbenchQARequest(BaseModel):
 
 
 class WorkbenchChunkingRequest(BaseModel):
-    technique: Literal["heading_aware", "recursive", "sentence", "token", "semantic"]
-    chunk_size: int = Field(default=512, ge=64, le=12000)
+    technique: Literal["recursive", "sentence", "token", "semantic"] = "sentence"
+    chunk_size: int = Field(default=512, ge=64, le=8000)
     overlap: int = Field(default=0, ge=0, le=4096)
     min_sentences_per_chunk: int = Field(default=1, ge=1, le=20)
     semantic_threshold: float = Field(default=0.8, ge=0.05, le=0.95)
@@ -418,27 +426,60 @@ async def connect_db(req: ConnectRequest):
                 host=params.get("host"),
                 port=params.get("port", 8000),
             )
+        elif db_type == "faiss":
+            from connectors.faiss_connector import FaissConnector
+
+            persist_directory = params.get("persist_directory")
+            if not persist_directory:
+                raise HTTPException(
+                    status_code=400,
+                    detail="persist_directory is required for FAISS.",
+                )
+            connector = FaissConnector(
+                collection_name=params.get("collection_name", "default"),
+                persist_directory=persist_directory,
+            )
+        elif db_type == "milvus_lite":
+            from connectors.milvus_lite_connector import MilvusLiteConnector
+
+            persist_directory = params.get("persist_directory")
+            if not persist_directory:
+                raise HTTPException(
+                    status_code=400,
+                    detail="persist_directory must be a local Milvus Lite .db database path.",
+                )
+            connector = MilvusLiteConnector(
+                collection_name=params.get("collection_name", "default"),
+                persist_directory=persist_directory,
+            )
         else:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unsupported db_type '{db_type}'. Currently supported: chroma",
+                detail=(
+                    f"Unsupported db_type '{db_type}'. Currently supported: "
+                    "chroma, faiss, milvus_lite"
+                ),
             )
 
         connector.connect()
         _state["connector"] = connector
+        _state["db_type"] = db_type
         _state["results"] = None
         _state["fault_annotations"] = {}
 
         # Gather collection list if possible
         collections: List[str] = []
         try:
-            if hasattr(connector, "client") and connector.client is not None:
+            if db_type in {"faiss", "milvus_lite"}:
+                collections = [connector.collection_name]
+            elif hasattr(connector, "client") and connector.client is not None:
                 raw = connector.client.list_collections()
                 # chromadb >=0.4 returns Collection objects; older returns strings
                 for c in raw:
                     collections.append(c.name if hasattr(c, "name") else str(c))
         except Exception:
-            collections = [params.get("collection_name", "default")]
+            if not collections:
+                collections = [params.get("collection_name", "default")]
 
         return {
             "status": "connected",
@@ -457,7 +498,11 @@ async def list_collections():
     try:
         conn = _require_connector()
         collections: List[str] = []
-        if hasattr(conn, "client") and conn.client is not None:
+        if _state.get("db_type") in {"faiss", "milvus_lite"}:
+            collection_name = getattr(conn, "collection_name", None)
+            if collection_name:
+                collections.append(collection_name)
+        elif hasattr(conn, "client") and conn.client is not None:
             raw = conn.client.list_collections()
             for c in raw:
                 collections.append(c.name if hasattr(c, "name") else str(c))
@@ -611,7 +656,7 @@ async def get_embedding_data(
 ):
     """Return 2D-projected embedding data for the Plotly scatter plot.
 
-    Samples vectors from the DB, projects them to 2D via PCA, and
+    Samples vectors from the DB and projects them to 2D with the requested method, then
     annotates each point with fault type if check results exist.
     """
     try:
@@ -636,8 +681,33 @@ async def get_embedding_data(
         if len(vectors) < 2:
             return {"points": [], "method": method.upper(), "message": "Not enough vectors to project."}
 
-        # PCA projection to 2D
-        points_2d = _pca_project(vectors)
+        if method == "random":
+            import random
+            from math import sqrt
+
+            dimensions = len(vectors[0])
+            means = [
+                sum(vector[dimension] for vector in vectors) / len(vectors)
+                for dimension in range(dimensions)
+            ]
+            rng = random.Random(42)
+            projection = [
+                [rng.gauss(0.0, 1.0) / sqrt(2.0) for _ in range(2)]
+                for _ in range(dimensions)
+            ]
+            points_2d = [
+                [
+                    sum(
+                        (vector[dimension] - means[dimension])
+                        * projection[dimension][axis]
+                        for dimension in range(dimensions)
+                    )
+                    for axis in range(2)
+                ]
+                for vector in vectors
+            ]
+        else:
+            points_2d = _pca_project(vectors)
 
         # Build response points
         points = []
@@ -651,7 +721,7 @@ async def get_embedding_data(
                 "fault_type": fault,
             })
 
-        return {"points": points, "method": "PCA"}
+        return {"points": points, "method": method.upper()}
     except HTTPException:
         raise
     except Exception as exc:
@@ -909,6 +979,7 @@ _pm = ProjectManager()
 class CreateProjectRequest(BaseModel):
     name: str
     description: str = ""
+    db_type: Literal["chroma", "faiss", "milvus_lite"] = "chroma"
 
 
 class UpdateProjectRequest(BaseModel):
@@ -933,7 +1004,7 @@ class AUTConfigModel(BaseModel):
 
 
 class VectorStoreConfigModel(BaseModel):
-    db_type: str = "chroma"
+    db_type: Literal["chroma", "faiss", "milvus_lite"] = "chroma"
     collection_name: str = ""
     persist_directory: str = ""
 
@@ -963,7 +1034,7 @@ async def list_projects():
 async def create_project(req: CreateProjectRequest):
     """Create a new project."""
     try:
-        project = _pm.create(req.name, req.description)
+        project = _pm.create(req.name, req.description, db_type=req.db_type)
         return project
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -1064,6 +1135,8 @@ async def save_project_settings(project_id: str, req: ProjectSettingsModel):
         return {"status": "saved", "project_id": project_id}
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found.")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -1096,49 +1169,46 @@ class ProjectVectorChecksRequest(BaseModel):
         ge=0.0,
         le=1.0,
     )
-    synthetic_question_record_id: Optional[str] = None
-    synthetic_question_texts: List[str] = Field(default_factory=list, max_length=3)
-    synthetic_question_top_k: int = Field(default=1, ge=1, le=100)
+    drift_max_score: float = Field(default=0.25, ge=0.0, le=1.0)
+    question_retrieval_top_k: int = Field(default=5, ge=1, le=20)
 
 
-@app.get("/api/projects/{project_id}/vector-records")
-async def get_project_vector_records(project_id: str):
-    """Return all text records from the project's Chroma collection."""
+class OffTopicQuestionSuggestionRequest(BaseModel):
+    topics: List[str] = Field(min_length=1, max_length=10)
+    count_per_topic: int = Field(ge=1, le=10)
+    api_key: SecretStr
+    endpoint: str
+    deployment: str
+    api_version: str
+
+
+@app.post("/api/projects/{project_id}/off-topic-question-suggestions")
+async def suggest_project_off_topic_questions(
+    project_id: str,
+    req: OffTopicQuestionSuggestionRequest,
+):
+    """Suggest selectable off-topic questions for the negative-query check."""
     try:
-        collection = open_project_collection(project_id)
-        total = collection.count()
-        records = []
-        batch_size = 500
-        for offset in range(0, total, batch_size):
-            data = collection.get(
-                limit=min(batch_size, total - offset),
-                offset=offset,
-                include=["documents", "metadatas"],
-            )
-            documents = data.get("documents") or []
-            metadatas = data.get("metadatas") or []
-            for index, record_id in enumerate(data.get("ids") or []):
-                records.append({
-                    "id": str(record_id),
-                    "text": (
-                        documents[index]
-                        if index < len(documents) and documents[index] is not None
-                        else ""
-                    ),
-                    "metadata": (
-                        metadatas[index] or {}
-                        if index < len(metadatas)
-                        else {}
-                    ),
-                })
-        return {
-            "records": records,
-            "total": len(records),
-        }
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found.")
+        _pm.get_project_dir(project_id)
+        from checks.off_topic_questions import generate_off_topic_questions
+
+        suggestions = await run_in_threadpool(
+            generate_off_topic_questions,
+            req.topics,
+            req.count_per_topic,
+            req.api_key.get_secret_value(),
+            req.endpoint,
+            req.deployment,
+            req.api_version,
+        )
+        return {"suggestions": suggestions}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found.") from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail=f"Off-topic question suggestion failed: {exc}") from exc
 
 
 @app.post("/api/projects/{project_id}/ingest")
@@ -1257,7 +1327,7 @@ async def get_ingested_data(
 
 @app.delete("/api/projects/{project_id}/ingested-data")
 async def delete_ingested_data(project_id: str):
-    """Clear all ingested data (Chroma collection + JSON file)."""
+    """Clear all ingested vector data and the JSON backup."""
     try:
         svc = IngestionService(project_id)
         return svc.clear_data()
@@ -1445,28 +1515,58 @@ async def get_project_visualization_with_qa(
         await file.close()
 
 
+@app.post("/api/workbench/analysis-jobs")
+async def create_workbench_analysis_job():
+    return react_workbench.create_analysis_job()
+
+
+@app.get("/api/workbench/analysis-jobs/{job_id}")
+async def get_workbench_analysis_progress(job_id: str):
+    try:
+        return react_workbench.get_analysis_progress(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @app.post("/api/workbench/analyze")
 async def analyze_workbench_pdfs(
     files: List[UploadFile] = File(...),
     mode: str = Form("crop"),
-    technique: str = Form("heading_aware"),
-    chunk_size: int = Form(2600),
-    overlap: int = Form(250),
+    object_types: List[str] = Form(["table", "image", "graph"]),
+    technique: str = Form("sentence"),
+    chunk_size: int = Form(512),
+    overlap: int = Form(0),
     min_sentences_per_chunk: int = Form(1),
     semantic_threshold: float = Form(0.8),
     api_key: str = Form(...),
     endpoint: str = Form(...),
     deployment: str = Form(...),
     api_version: str = Form(...),
+    job_id: str = Form(...),
 ):
     """Analyze PDFs and keep the interactive workbench data for this API process."""
     uploads = []
+    total_bytes = 0
     try:
+        if len(files) > react_workbench.MAX_PDF_COUNT:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Upload no more than {react_workbench.MAX_PDF_COUNT} PDFs at once.",
+            )
         for uploaded in files:
-            uploads.append((
-                os.path.basename(uploaded.filename or "upload.pdf"),
-                await uploaded.read(),
-            ))
+            filename = os.path.basename(uploaded.filename or "upload.pdf")
+            if not filename.casefold().endswith(".pdf"):
+                raise HTTPException(status_code=422, detail="Only PDF files are supported.")
+            content = await uploaded.read(
+                react_workbench.MAX_UPLOAD_BYTES - total_bytes + 1
+            )
+            total_bytes += len(content)
+            if total_bytes > react_workbench.MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="The combined PDF upload must not exceed 100 MB.",
+                )
+            uploads.append((filename, content))
         chunking = WorkbenchChunkingRequest(
             technique=technique,
             chunk_size=chunk_size,
@@ -1486,10 +1586,17 @@ async def analyze_workbench_pdfs(
             mode,
             chunking,
             credentials,
+            object_types,
+            job_id,
         )
+    except HTTPException as exc:
+        react_workbench.fail_analysis_job(job_id, str(exc.detail))
+        raise
     except ValueError as exc:
+        react_workbench.fail_analysis_job(job_id, str(exc))
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
+        react_workbench.fail_analysis_job(job_id, str(exc))
         traceback.print_exc()
         raise HTTPException(
             status_code=500,
@@ -1640,8 +1747,35 @@ async def review_expected_answers(
 async def ingest_project_pdfs(
     project_id: str,
     files: List[UploadFile] = File(...),
+    job_id: str = Form(""),
+    chunking_json: str = Form(""),
 ):
-    """Extract uploaded PDFs with Docling and persist their chunks in Chroma."""
+    """Extract and embed PDF figures, prose, and tables."""
+    try:
+        chunking = WorkbenchChunkingRequest.model_validate_json(
+            chunking_json or "{}"
+        )
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid PDF chunking configuration: {exc}",
+        ) from exc
+    if chunking.chunk_size > MAX_INGESTION_CHUNK_SIZE:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "PDF ingestion chunk size cannot exceed "
+                f"{MAX_INGESTION_CHUNK_SIZE} tokens."
+            ),
+        )
+    if (
+        chunking.technique in {"sentence", "token"}
+        and chunking.overlap >= chunking.chunk_size
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="PDF ingestion overlap must be smaller than chunk size.",
+        )
     try:
         _pm.get_project_dir(project_id)
     except FileNotFoundError:
@@ -1649,11 +1783,93 @@ async def ingest_project_pdfs(
 
     outcomes = []
     errors = []
+    resolved_job_id = job_id or uuid.uuid4().hex
+    started_at = time.time()
+    with PDF_INGESTION_JOBS_LOCK:
+        active_job = next(
+            (
+                job
+                for job in PDF_INGESTION_JOBS.values()
+                if job.get("project_id") == project_id
+                and job.get("status") == "running"
+            ),
+            None,
+        )
+        if active_job is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "PDF ingestion is already running for this project "
+                    f"(job {active_job['job_id']})."
+                ),
+            )
+        PDF_INGESTION_JOBS[resolved_job_id] = {
+            "job_id": resolved_job_id,
+            "project_id": project_id,
+            "status": "running",
+            "phase": "queued",
+            "progress": 0,
+            "message": "Preparing PDF ingestion...",
+            "current_file": "",
+            "file_index": 0,
+            "file_total": len(files),
+            "records_current": 0,
+            "records_total": 0,
+            "batch_current": 0,
+            "batch_total": 0,
+            "elapsed_seconds": 0,
+            "started_at": started_at,
+        }
+    file_index = 0
     for uploaded in files:
+        file_index += 1
         filename = os.path.basename(uploaded.filename or "upload.pdf")
+        def update_progress(
+            progress: int,
+            phase: str,
+            message: str,
+            **details: Any,
+        ) -> None:
+            overall = int(
+                ((file_index - 1) / max(1, len(files))) * 100
+                + (progress / max(1, len(files)))
+            )
+            overall = min(99, max(0, overall))
+            with PDF_INGESTION_JOBS_LOCK:
+                job = PDF_INGESTION_JOBS.get(resolved_job_id)
+                if job is not None:
+                    job.update({
+                        "status": "running",
+                        "phase": phase,
+                        "progress": overall,
+                        "message": message,
+                        "current_file": filename,
+                        "file_index": file_index,
+                        "file_total": len(files),
+                        "elapsed_seconds": int(time.time() - started_at),
+                        **details,
+                    })
+        with PDF_INGESTION_JOBS_LOCK:
+            job = PDF_INGESTION_JOBS.get(resolved_job_id)
+            if job is not None:
+                job.update({
+                    "phase": "queued",
+                    "progress": int(((file_index - 1) / max(1, len(files))) * 100),
+                    "message": f"Starting {filename}",
+                    "current_file": filename,
+                    "file_index": file_index,
+                    "file_total": len(files),
+                })
         content = await uploaded.read()
         try:
-            outcome = await run_in_threadpool(ingest_pdf, project_id, filename, content)
+            outcome = await run_in_threadpool(
+                ingest_pdf,
+                project_id,
+                filename,
+                content,
+                update_progress,
+                chunking.model_dump(),
+            )
             outcomes.append(outcome)
         except (ValueError, FileNotFoundError) as exc:
             errors.append({"pdf_name": filename, "error": str(exc)})
@@ -1667,13 +1883,188 @@ async def ingest_project_pdfs(
             await uploaded.close()
 
     if errors and not outcomes:
+        with PDF_INGESTION_JOBS_LOCK:
+            job = PDF_INGESTION_JOBS.get(resolved_job_id)
+            if job is not None:
+                job.update({
+                    "status": "failed",
+                    "phase": "failed",
+                    "progress": 100,
+                    "message": "PDF ingestion failed",
+                    "elapsed_seconds": int(time.time() - started_at),
+                    "errors": errors,
+                })
         raise HTTPException(status_code=422, detail={"errors": errors})
-    return {
+    image_records_ingested = sum(
+        item.get("image_records_ingested", item["chunks_ingested"])
+        for item in outcomes
+    )
+    text_records_ingested = sum(
+        item.get("text_records_ingested", 0) for item in outcomes
+    )
+    table_records_ingested = sum(
+        item.get("table_records_ingested", 0) for item in outcomes
+    )
+    chunks_ingested = sum(item["chunks_ingested"] for item in outcomes)
+    result = {
         "status": "partial" if errors else "success",
+        "job_id": resolved_job_id,
         "files": outcomes,
         "errors": errors,
-        "chunks_ingested": sum(item["chunks_ingested"] for item in outcomes),
+        "image_records_ingested": image_records_ingested,
+        "text_records_ingested": text_records_ingested,
+        "table_records_ingested": table_records_ingested,
+        "chunks_ingested": chunks_ingested,
     }
+    with PDF_INGESTION_JOBS_LOCK:
+        job = PDF_INGESTION_JOBS.get(resolved_job_id)
+        if job is not None:
+            job.update({
+                "status": "complete",
+                "phase": "complete",
+                "progress": 100,
+                "message": "PDF ingestion completed",
+                "elapsed_seconds": int(time.time() - started_at),
+                "image_records_ingested": image_records_ingested,
+                "text_records_ingested": text_records_ingested,
+                "table_records_ingested": table_records_ingested,
+                "chunks_ingested": chunks_ingested,
+                "errors": errors,
+            })
+    return result
+
+
+@app.get("/api/projects/{project_id}/ingestion-progress/{job_id}")
+async def get_pdf_ingestion_progress(project_id: str, job_id: str):
+    with PDF_INGESTION_JOBS_LOCK:
+        job = PDF_INGESTION_JOBS.get(job_id)
+        if job is None or job.get("project_id") != project_id:
+            raise HTTPException(status_code=404, detail="Ingestion job not found.")
+        return dict(job)
+
+
+@app.get("/api/projects/{project_id}/vector-records")
+async def get_project_vector_records(
+    project_id: str,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=100),
+):
+    """Return a page of full text chunks from the project's vector store."""
+    try:
+        project_dir = _pm.get_project_dir(project_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found.")
+
+    def read_page() -> dict[str, Any]:
+        collection = open_project_collection(
+            project_id,
+            create=True,
+            projects_dir=Path(project_dir).parent,
+        )
+        total = collection.count()
+        offset = (page - 1) * page_size
+        records = []
+
+        if isinstance(collection, VectorDBConnector):
+            page_records = islice(
+                collection.scan(batch_size=page_size),
+                offset,
+                offset + page_size,
+            )
+            for record in page_records:
+                metadata = dict(record.metadata or {})
+                text = metadata.pop("document", "")
+                if not isinstance(text, str) or not text:
+                    fetched = collection.fetch(record.id)
+                    if fetched is not None:
+                        metadata = dict(fetched.metadata or {})
+                        text = metadata.pop("document", "")
+                records.append({
+                    "id": record.id,
+                    "text": text if isinstance(text, str) else "",
+                    "metadata": metadata,
+                })
+        else:
+            result = collection.get(
+                limit=page_size,
+                offset=offset,
+                include=["documents", "metadatas"],
+            )
+            ids = result.get("ids") or []
+            documents = result.get("documents") or []
+            metadatas = result.get("metadatas") or []
+            for index, record_id in enumerate(ids):
+                text = documents[index] if index < len(documents) else ""
+                metadata = metadatas[index] if index < len(metadatas) else {}
+                records.append({
+                    "id": str(record_id),
+                    "text": text if isinstance(text, str) else "",
+                    "metadata": dict(metadata) if isinstance(metadata, dict) else {},
+                })
+
+        return {
+            "records": records,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
+
+    try:
+        return await run_in_threadpool(read_page)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not load project vector records: {exc}",
+        ) from exc
+
+
+@app.get("/api/projects/{project_id}/vector-records/{record_id}/image")
+async def get_project_vector_record_image(project_id: str, record_id: str):
+    try:
+        project_dir = _pm.get_project_dir(project_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"Project '{project_id}' not found."
+        ) from exc
+
+    def find_image() -> Path:
+        collection = open_project_collection(
+            project_id,
+            create=True,
+            projects_dir=Path(project_dir).parent,
+        )
+        if isinstance(collection, VectorDBConnector):
+            record = collection.fetch(record_id)
+            metadata = dict(record.metadata or {}) if record is not None else {}
+        else:
+            result = collection.get(
+                ids=[record_id],
+                include=["metadatas"],
+            )
+            metadatas = result.get("metadatas") or []
+            metadata = (
+                metadatas[0]
+                if metadatas and isinstance(metadatas[0], dict)
+                else {}
+            )
+
+        image_path_value = metadata.get("image_path")
+        if not isinstance(image_path_value, str) or not image_path_value:
+            raise FileNotFoundError("No image is stored for this vector record.")
+        image_path = Path(image_path_value).resolve()
+        objects_dir = (Path(project_dir) / "objects").resolve()
+        if not image_path.is_relative_to(objects_dir) or not image_path.is_file():
+            raise FileNotFoundError("The stored figure image is unavailable.")
+        return image_path
+
+    try:
+        image_path = await run_in_threadpool(find_image)
+    except (FileNotFoundError, KeyError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(image_path, media_type="image/png")
 
 
 @app.post("/api/projects/{project_id}/run-vector-checks")
@@ -1681,9 +2072,10 @@ async def run_project_vector_checks(
     project_id: str,
     req: ProjectVectorChecksRequest,
 ):
-    """Run selected checks against the project's persistent Chroma collection."""
+    """Run selected checks against the project's configured vector collection."""
     try:
         project_dir = _pm.get_project_dir(project_id)
+        vector_config = _pm.get_settings(project_id).get("vector_store_config", {})
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found.")
 
@@ -1697,20 +2089,25 @@ async def run_project_vector_checks(
         check_report = await run_in_threadpool(
             run_project_checks,
             project_id,
-            os.path.join(project_dir, "chroma_data"),
+            vector_config.get("persist_directory")
+            or os.fspath(
+                default_storage_location(
+                    project_dir, vector_config.get("db_type", "chroma")
+                )
+            ),
             req.selected_checks,
             req.required_fields,
             req.duplicate_min_similarity,
             req.duplicate_max_similarity,
             req.negative_query_texts,
             req.negative_query_max_similarity,
-            req.synthetic_question_record_id,
-            req.synthetic_question_texts,
-            req.synthetic_question_top_k,
         )
         html_report = generate_report(
             check_report["results"],
-            db_label=f"Chroma / {project_id}_knowledge_base",
+            db_label=(
+                f"{str(vector_config.get('db_type', 'chroma')).upper()} / "
+                f"{vector_config.get('collection_name') or f'{project_id}_knowledge_base'}"
+            ),
         )
         report_id = f"vector_checks_{uuid.uuid4().hex[:12]}"
         _pm.save_result(project_id, report_id, check_report)
@@ -1727,6 +2124,188 @@ async def run_project_vector_checks(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.post("/api/projects/{project_id}/run-workbook-checks")
+async def run_project_workbook_checks(
+    project_id: str,
+    file: UploadFile = File(...),
+    config_json: str = Form(...),
+    api_key: str = Form(""),
+    endpoint: str = Form(""),
+    deployment: str = Form(""),
+    api_version: str = Form(""),
+):
+    """Run selected vector checks using workbook questions and optional AUT drift."""
+    try:
+        req = ProjectVectorChecksRequest.model_validate_json(config_json)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid workbook-check configuration: {exc}",
+        ) from exc
+
+    filename = os.path.basename(file.filename or "qa_workbook.xlsx")
+    if not filename.casefold().endswith(".xlsx"):
+        await file.close()
+        raise HTTPException(status_code=422, detail="Upload a valid .xlsx workbook.")
+
+    try:
+        project_dir = _pm.get_project_dir(project_id)
+        vector_config = _pm.get_settings(project_id).get("vector_store_config", {})
+        workbook_bytes = await file.read(25 * 1024 * 1024 + 1)
+        if len(workbook_bytes) > 25 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Workbook exceeds the 25 MB upload limit.")
+
+        from services.aut_vector_drift import (
+            evaluate_aut_vector_drift,
+            read_workbook_questions,
+        )
+
+        workbook_questions = read_workbook_questions(workbook_bytes)
+        selected_checks = list(req.selected_checks)
+        drift_selected = "aut_vector_drift" in selected_checks
+        vector_checks = [check for check in selected_checks if check != "aut_vector_drift"]
+        unknown_checks = set(vector_checks) - CHECK_CATEGORIES
+        if unknown_checks:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unknown check category/categories: {', '.join(sorted(unknown_checks))}",
+            )
+        if not selected_checks:
+            raise HTTPException(status_code=422, detail="Select at least one check.")
+
+        results = []
+        if vector_checks:
+            vector_report = await run_in_threadpool(
+                run_project_checks,
+                project_id,
+                vector_config.get("persist_directory")
+                or os.fspath(
+                    default_storage_location(
+                        project_dir, vector_config.get("db_type", "chroma")
+                    )
+                ),
+                vector_checks,
+                req.required_fields,
+                req.duplicate_min_similarity,
+                req.duplicate_max_similarity,
+                req.negative_query_texts,
+                req.negative_query_max_similarity,
+                workbook_questions=[
+                    item["question"] for item in workbook_questions
+                ] if {
+                    "vector_integrity",
+                    "neighbor_consistency",
+                    "duplicate_detection",
+                    "metadata_completeness",
+                }.intersection(vector_checks) else None,
+                question_retrieval_top_k=req.question_retrieval_top_k,
+            )
+            results.extend(vector_report["results"])
+
+        drift_workbook = None
+        if drift_selected:
+            if not all(value.strip() for value in (api_key, endpoint, deployment, api_version)):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Configure Azure OpenAI credentials before running AUT-Vector Drift.",
+                )
+            status = await mock_aut_status()
+            if not status.get("running") or status.get("outdated"):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Start or restart the Mock AUT in Configure before running AUT-Vector Drift.",
+                )
+
+            def evaluate_drift():
+                from clients.api_client import ApiClient
+                from openai import AzureOpenAI
+
+                judge_client = AzureOpenAI(
+                    api_key=api_key,
+                    azure_endpoint=endpoint,
+                    api_version=api_version,
+                )
+                aut_client = ApiClient(status["url"])
+                return evaluate_aut_vector_drift(
+                    workbook_bytes,
+                    project_id,
+                    vector_config.get("persist_directory")
+                    or os.fspath(
+                        default_storage_location(
+                            project_dir, vector_config.get("db_type", "chroma")
+                        )
+                    ),
+                    lambda question, active_project, top_k, retrieved_contexts: aut_client.query_mock_aut(
+                        question,
+                        active_project,
+                        top_k,
+                        retrieved_contexts,
+                    ),
+                    judge_client,
+                    deployment,
+                    req.drift_max_score,
+                    req.question_retrieval_top_k,
+                    api_key,
+                )
+
+            drift_bytes, drift_summary = await run_in_threadpool(evaluate_drift)
+            drift_workbook = {
+                "filename": f"{Path(filename).stem}_aut_vector_drift.xlsx",
+                "content_base64": base64.b64encode(drift_bytes).decode("ascii"),
+                "summary": {
+                    key: value
+                    for key, value in drift_summary.items()
+                    if key != "question_results"
+                },
+            }
+            results.append({
+                "check": "AUT-Vector Drift",
+                "passed": (
+                    drift_summary["failed"] == 0
+                    and drift_summary["errors"] == 0
+                ),
+                "detail": drift_summary,
+            })
+
+        check_report = {
+            "results": results,
+            "summary": {
+                "passed": sum(result.get("passed") is True for result in results),
+                "failed": sum(result.get("passed") is False for result in results),
+                "inconclusive": sum(result.get("passed") is None for result in results),
+                "total": len(results),
+            },
+        }
+        html_report = generate_report(
+            check_report["results"],
+            db_label=(
+                f"{str(vector_config.get('db_type', 'chroma')).upper()} / "
+                f"{vector_config.get('collection_name') or f'{project_id}_knowledge_base'}"
+            ),
+        )
+        report_id = f"vector_checks_{uuid.uuid4().hex[:12]}"
+        _pm.save_result(project_id, report_id, check_report)
+        return {
+            **check_report,
+            "project_id": project_id,
+            "report_id": report_id,
+            "html_report": html_report,
+            "drift_workbook": drift_workbook,
+            "workbook_questions": workbook_questions,
+        }
+    except HTTPException:
+        raise
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found.")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Workbook checks failed: {exc}") from exc
+    finally:
+        await file.close()
+
+
 # ══════════════════════════════════════════════════════════════════════
 # ── MOCK AUT MANAGEMENT APIs (Phase 5 — Mock AUT) ─────────────────────
 # ══════════════════════════════════════════════════════════════════════
@@ -1739,7 +2318,7 @@ _mock_aut_state: Dict[str, Any] = {
     "source_mtime_ns": None,
 }
 
-MOCK_AUT_PROMPT_VERSION = "direct-answer-v3"
+MOCK_AUT_PROMPT_VERSION = "direct-answer-v9"
 
 
 def _mock_aut_server_directory() -> str:
@@ -1886,6 +2465,7 @@ async def start_mock_aut(req: MockAUTStartRequest):
         server_dir = os.path.dirname(os.path.abspath(__file__))
         mock_aut_env = os.environ.copy()
         mock_aut_env.update(credentials)
+        mock_aut_env["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         proc = subprocess.Popen(
             [
                 sys.executable, "-m", "uvicorn",
@@ -1895,8 +2475,8 @@ async def start_mock_aut(req: MockAUTStartRequest):
             ],
             cwd=server_dir,
             env=mock_aut_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             creationflags=(
                 subprocess.CREATE_NEW_PROCESS_GROUP
                 if os.name == "nt"
@@ -1989,6 +2569,86 @@ async def mock_aut_status():
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/projects/{project_id}/evaluate-workbook")
+async def evaluate_aut_workbook(
+    project_id: str,
+    file: UploadFile = File(...),
+    api_key: str = Form(...),
+    endpoint: str = Form(...),
+    deployment: str = Form(...),
+    api_version: str = Form(...),
+):
+    """Run an uploaded Q&A workbook against the Mock AUT and Azure OpenAI judge."""
+    filename = os.path.basename(file.filename or "qa_validation.xlsx")
+    if not filename.casefold().endswith(".xlsx"):
+        await file.close()
+        raise HTTPException(status_code=422, detail="Upload a valid .xlsx workbook.")
+
+    try:
+        try:
+            _pm.get_project_dir(project_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found.") from exc
+
+        status = await mock_aut_status()
+        if not status.get("running") or status.get("outdated"):
+            raise HTTPException(
+                status_code=409,
+                detail="Start or restart the current Mock AUT before evaluating the workbook.",
+            )
+        if not all(value.strip() for value in (api_key, endpoint, deployment, api_version)):
+            raise HTTPException(status_code=422, detail="Enter all Azure OpenAI credentials.")
+
+        workbook_bytes = await file.read()
+        if len(workbook_bytes) > 25 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Workbook exceeds the 25 MB upload limit.")
+
+        def evaluate():
+            from clients.api_client import ApiClient
+            from pdf_workbench import custom_logic
+            from openai import AzureOpenAI
+            from services.workbook_evaluation import evaluate_workbook
+
+            judge_client = AzureOpenAI(
+                api_key=api_key,
+                azure_endpoint=endpoint,
+                api_version=api_version,
+            )
+            aut_client = ApiClient(status["url"])
+            return evaluate_workbook(
+                workbook_bytes,
+                project_id,
+                lambda question, active_project: aut_client.query_mock_aut(
+                    question, active_project
+                ),
+                lambda question, expected, actual: custom_logic.judge_answer(
+                    question,
+                    expected,
+                    actual,
+                    client_override=judge_client,
+                    model_name=deployment,
+                ),
+            )
+
+        completed, summary = await run_in_threadpool(evaluate)
+        return {
+            "filename": f"{Path(filename).stem}_evaluated.xlsx",
+            "content_base64": base64.b64encode(completed).decode("ascii"),
+            "summary": summary,
+        }
+    except HTTPException:
+        raise
+    except WorkbookEvaluationServiceError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Workbook evaluation failed: {exc}") from exc
+    finally:
+        await file.close()
 
 
 # ══════════════════════════════════════════════════════════════════════

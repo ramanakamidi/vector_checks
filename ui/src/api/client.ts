@@ -17,7 +17,9 @@ import type {
   ExecutionResult,
   ExecutionListItem,
   MockAutStatus,
+  PaginatedVectorRecords,
 } from './types';
+import type { AzureCredentials, ChunkingOptions } from './workbench';
 
 const BASE = '/api';
 
@@ -39,10 +41,14 @@ export async function listProjects(): Promise<{ projects: Project[] }> {
   return request<{ projects: Project[] }>('/projects');
 }
 
-export async function createProject(name: string, description = ''): Promise<Project> {
+export async function createProject(
+  name: string,
+  description = '',
+  dbType: 'chroma' | 'faiss' | 'milvus_lite' = 'chroma',
+): Promise<Project> {
   return request<Project>('/projects', {
     method: 'POST',
-    body: JSON.stringify({ name, description }),
+    body: JSON.stringify({ name, description, db_type: dbType }),
   });
 }
 
@@ -264,11 +270,26 @@ export function getExecutionReportUrl(projectId: string, executionId: string): s
 
 export async function startMockAut(
   projectId: string,
+  credentials: AzureCredentials,
   port = 8001,
-): Promise<MockAutStatus> {
-  return request<MockAutStatus>('/mock-aut/start', {
+): Promise<{
+  status: string;
+  url: string;
+  pid: number;
+  project_id: string | null;
+  prompt_version: string;
+  restarted_stale_process?: boolean;
+}> {
+  return request('/mock-aut/start', {
     method: 'POST',
-    body: JSON.stringify({ project_id: projectId, port }),
+    body: JSON.stringify({
+      project_id: projectId,
+      port,
+      api_key: credentials.api_key,
+      endpoint: credentials.endpoint,
+      deployment: credentials.deployment,
+      api_version: credentials.api_version,
+    }),
   });
 }
 
@@ -280,6 +301,209 @@ export async function stopMockAut(): Promise<{ status: string }> {
 
 export async function getMockAutStatus(): Promise<MockAutStatus> {
   return request<MockAutStatus>('/mock-aut/status');
+}
+
+export async function runProjectVectorChecks(
+  projectId: string,
+  config: ProjectVectorChecksConfig,
+): Promise<{
+  project_id: string;
+  report_id: string;
+  summary: { passed: number; failed: number; inconclusive: number; total: number };
+  results: Array<{ check: string; passed: boolean | null; detail: Record<string, unknown> }>;
+  html_report: string;
+}> {
+  return request(`/projects/${encodeURIComponent(projectId)}/run-vector-checks`, {
+    method: 'POST',
+    body: JSON.stringify(config),
+  });
+}
+
+export interface ProjectVectorChecksConfig {
+  selected_checks: string[];
+  required_fields: string[];
+  duplicate_min_similarity: number;
+  duplicate_max_similarity: number;
+  negative_query_texts: string[];
+  negative_query_max_similarity: number;
+  drift_max_score: number;
+  question_retrieval_top_k: number;
+}
+
+export async function runProjectWorkbookChecks(
+  projectId: string,
+  file: File,
+  config: ProjectVectorChecksConfig,
+  credentials: AzureCredentials,
+): Promise<{
+  project_id: string;
+  report_id: string;
+  summary: { passed: number; failed: number; inconclusive: number; total: number };
+  results: Array<{ check: string; passed: boolean | null; detail: Record<string, unknown> }>;
+  html_report: string;
+  workbook_questions: Array<{
+    question_index: number;
+    row: number;
+    question: string;
+    expected_answer?: unknown;
+    actual_answer?: unknown;
+    pdf_name?: unknown;
+    page_number?: unknown;
+    source_pages?: unknown;
+  }>;
+  drift_workbook: {
+    filename: string;
+    content_base64: string;
+    summary: Record<string, unknown>;
+  } | null;
+}> {
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('config_json', JSON.stringify(config));
+  formData.append('api_key', credentials.api_key);
+  formData.append('endpoint', credentials.endpoint);
+  formData.append('deployment', credentials.deployment);
+  formData.append('api_version', credentials.api_version);
+
+  const response = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}/run-workbook-checks`,
+    { method: 'POST', body: formData },
+  );
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`API ${response.status}: ${body}`);
+  }
+  return response.json();
+}
+
+export async function suggestOffTopicQuestions(
+  projectId: string,
+  topics: string[],
+  countPerTopic: number,
+  credentials: AzureCredentials,
+): Promise<{ suggestions: Array<{ topic: string; questions: string[] }> }> {
+  return request(`/projects/${encodeURIComponent(projectId)}/off-topic-question-suggestions`, {
+    method: 'POST',
+    body: JSON.stringify({
+      topics,
+      count_per_topic: countPerTopic,
+      api_key: credentials.api_key,
+      endpoint: credentials.endpoint,
+      deployment: credentials.deployment,
+      api_version: credentials.api_version,
+    }),
+  });
+}
+
+export async function uploadProjectPdfs(
+  projectId: string,
+  files: File[],
+  jobId?: string,
+  chunking?: ChunkingOptions,
+): Promise<{
+  status: string;
+  job_id?: string;
+  files: Array<Record<string, unknown>>;
+  errors: Array<Record<string, unknown>>;
+  chunks_ingested: number;
+  image_records_ingested: number;
+  text_records_ingested: number;
+  table_records_ingested: number;
+}> {
+  const formData = new FormData();
+  files.forEach((file) => formData.append('files', file));
+  if (jobId) formData.append('job_id', jobId);
+  if (chunking) formData.append('chunking_json', JSON.stringify(chunking));
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/ingest-pdfs`, {
+    method: 'POST',
+    body: formData,
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`API ${response.status}: ${body}`);
+  }
+  return response.json();
+}
+
+export interface PdfIngestionProgress {
+  job_id: string;
+  project_id: string;
+  status: 'running' | 'complete' | 'failed';
+  phase: string;
+  progress: number;
+  message: string;
+  current_file: string;
+  file_index: number;
+  file_total: number;
+  records_current: number;
+  records_total: number;
+  batch_current: number;
+  batch_total: number;
+  elapsed_seconds: number;
+  chunks_ingested?: number;
+  image_records_ingested?: number;
+  text_records_ingested?: number;
+  table_records_ingested?: number;
+  errors?: Array<Record<string, unknown>>;
+}
+
+export async function getPdfIngestionProgress(
+  projectId: string,
+  jobId: string,
+): Promise<PdfIngestionProgress> {
+  return request<PdfIngestionProgress>(
+    `/projects/${encodeURIComponent(projectId)}/ingestion-progress/${encodeURIComponent(jobId)}`,
+  );
+}
+
+export async function getProjectVectorRecords(
+  projectId: string,
+  page = 1,
+  pageSize = 50,
+): Promise<PaginatedVectorRecords> {
+  const params = new URLSearchParams({
+    page: String(page),
+    page_size: String(pageSize),
+  });
+  return request<PaginatedVectorRecords>(
+    `/projects/${encodeURIComponent(projectId)}/vector-records?${params}`,
+  );
+}
+
+export async function evaluateAutWorkbook(
+  projectId: string,
+  file: File,
+  credentials: AzureCredentials,
+): Promise<{
+  filename: string;
+  content_base64: string;
+  summary: {
+    passed?: number;
+    failed?: number;
+    errors?: number;
+    error_details?: Array<{
+      row: number;
+      question: string;
+      error: string;
+    }>;
+  };
+}> {
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('api_key', credentials.api_key);
+  formData.append('endpoint', credentials.endpoint);
+  formData.append('deployment', credentials.deployment);
+  formData.append('api_version', credentials.api_version);
+
+  const response = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}/evaluate-workbook`,
+    { method: 'POST', body: formData },
+  );
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`API ${response.status}: ${body}`);
+  }
+  return response.json();
 }
 
 // ── Legacy APIs (preserved) ──────────────────────────────────────────

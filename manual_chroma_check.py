@@ -15,7 +15,7 @@ from typing import Any
 
 import chromadb
 
-from services.local_embeddings import embed_texts
+from services.local_embeddings import embed_text_query
 from services.paths import PROJECTS_DIR
 
 
@@ -232,7 +232,7 @@ def _run_question(collection: Any, question: str, requested_k: int) -> None:
             f"{count} record(s); querying k={actual_k}."
         )
 
-    query_vector = embed_texts([question])[0]
+    query_vector = embed_text_query(question)
     result = collection.query(
         query_embeddings=[query_vector],
         n_results=actual_k,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 import uuid
@@ -14,9 +15,53 @@ from services.paths import PROJECT_ROOT
 
 _lock = threading.RLock()
 _sessions: dict[str, dict[str, Any]] = {}
-_output_root = PROJECT_ROOT / "streamlit_output" / "react_sessions"
-_MAX_UPLOAD_BYTES = 100 * 1024 * 1024
-_MAX_PDF_COUNT = 10
+_analysis_progress_lock = threading.Lock()
+_analysis_progress: dict[str, dict[str, Any]] = {}
+_output_root = PROJECT_ROOT / "ui" / "workbench_output" / "react_sessions"
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+MAX_PDF_COUNT = 10
+
+
+def create_analysis_job() -> dict[str, Any]:
+    job_id = uuid.uuid4().hex
+    progress = {
+        "job_id": job_id,
+        "status": "running",
+        "progress": 0,
+        "message": "Preparing to analyze PDFs...",
+    }
+    with _analysis_progress_lock:
+        _analysis_progress[job_id] = progress
+    return dict(progress)
+
+
+def get_analysis_progress(job_id: str) -> dict[str, Any]:
+    with _analysis_progress_lock:
+        progress = _analysis_progress.get(job_id)
+        if progress is None:
+            raise KeyError(f"Workbench analysis job '{job_id}' was not found.")
+        return dict(progress)
+
+
+def _update_analysis_progress(
+    job_id: str | None,
+    progress: int,
+    message: str,
+    status: str = "running",
+) -> None:
+    if job_id is None:
+        return
+    with _analysis_progress_lock:
+        if job_id in _analysis_progress:
+            _analysis_progress[job_id].update({
+                "status": status,
+                "progress": progress,
+                "message": message,
+            })
+
+
+def fail_analysis_job(job_id: str, message: str) -> None:
+    _update_analysis_progress(job_id, 0, message, "failed")
 
 
 def _chunk_documents(
@@ -91,6 +136,10 @@ def _public_session(session_id: str, state: dict[str, Any]) -> dict[str, Any]:
             _public_object(session_id, record)
             for record in state["objects"]
         ],
+        "text_enabled": state.get(
+            "text_enabled",
+            bool(state.get("documents") or state.get("text_chunks")),
+        ),
         "text_chunks": state["text_chunks"],
         "text_errors": state["text_errors"],
         "chunking": state["chunking"],
@@ -100,20 +149,63 @@ def _public_session(session_id: str, state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _save_session(session_id: str, state: dict[str, Any]) -> None:
+    session_dir = Path(state["session_dir"])
+    manifest_path = session_dir / "session.json"
+    temporary_path = manifest_path.with_suffix(".json.tmp")
+    with temporary_path.open("w", encoding="utf-8") as manifest:
+        json.dump(state, manifest, ensure_ascii=False)
+    temporary_path.replace(manifest_path)
+
+
+def _get_state(session_id: str) -> dict[str, Any] | None:
+    state = _sessions.get(session_id)
+    if state is not None:
+        return state
+    if not re.fullmatch(r"[a-f0-9]{32}", session_id):
+        return None
+
+    session_dir = (_output_root / session_id).resolve()
+    if not session_dir.is_relative_to(_output_root.resolve()):
+        return None
+    manifest_path = session_dir / "session.json"
+    try:
+        with manifest_path.open("r", encoding="utf-8") as manifest:
+            state = json.load(manifest)
+    except FileNotFoundError:
+        return None
+    if not isinstance(state, dict):
+        raise ValueError(f"Workbench session '{session_id}' has invalid saved data.")
+    state["session_dir"] = session_dir
+    _sessions[session_id] = state
+    return state
+
+
 def analyze_pdfs(
     uploads: list[tuple[str, bytes]],
     mode: str,
     chunking: dict[str, Any],
     credentials: dict[str, str],
+    object_types: list[str] | None = None,
+    progress_job_id: str | None = None,
 ) -> dict[str, Any]:
     if not uploads:
         raise ValueError("Upload at least one PDF.")
-    if len(uploads) > _MAX_PDF_COUNT:
-        raise ValueError(f"Upload no more than {_MAX_PDF_COUNT} PDFs at once.")
-    if sum(len(content) for _, content in uploads) > _MAX_UPLOAD_BYTES:
+    if len(uploads) > MAX_PDF_COUNT:
+        raise ValueError(f"Upload no more than {MAX_PDF_COUNT} PDFs at once.")
+    if sum(len(content) for _, content in uploads) > MAX_UPLOAD_BYTES:
         raise ValueError("The combined PDF upload must not exceed 100 MB.")
     if mode not in {"crop", "page", "page_context"}:
         raise ValueError("Choose a supported vision context mode.")
+    selected_types = set(
+        {"table", "image", "graph"} if object_types is None else object_types
+    )
+    supported_types = {"table", "image", "graph", "text"}
+    unsupported_types = selected_types - supported_types
+    if unsupported_types:
+        raise ValueError(f"Unsupported object type(s): {', '.join(sorted(unsupported_types))}.")
+    if not selected_types:
+        raise ValueError("Select at least one object type to analyze.")
     if any(not name.casefold().endswith(".pdf") for name, _ in uploads):
         raise ValueError("Only PDF files are supported.")
 
@@ -122,14 +214,20 @@ def analyze_pdfs(
     upload_dir = session_dir / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=False)
     pdf_paths: list[Path] = []
+    _update_analysis_progress(progress_job_id, 4, "Saving uploaded PDFs...")
     for index, (filename, content) in enumerate(uploads):
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(filename).name)
         if not safe_name.casefold().endswith(".pdf"):
             safe_name += ".pdf"
-        destination = upload_dir / f"{index + 1}_{safe_name}"
+        file_dir = upload_dir / str(index + 1)
+        file_dir.mkdir()
+        destination = file_dir / safe_name
         destination.write_bytes(content)
         pdf_paths.append(destination)
+    _update_analysis_progress(progress_job_id, 8, "Starting PDF analysis...")
 
+    text_enabled = "text" in selected_types
+    object_types = selected_types & {"table", "image", "graph"}
     documents: list[dict[str, Any]] = []
     with _lock:
         custom_logic.configure_azure_openai(
@@ -138,17 +236,47 @@ def analyze_pdfs(
             credentials["deployment"],
             credentials["api_version"],
         )
+        process_options: dict[str, Any] = {}
+        if progress_job_id is not None:
+            process_options["progress_callback"] = lambda message, fraction: (
+                _update_analysis_progress(
+                    progress_job_id,
+                    8 + round(fraction * 78),
+                    message,
+                )
+            )
         _, objects = custom_logic.process_pdf_files(
             pdf_paths,
             str(session_dir / "objects"),
             mode,
-            text_documents=documents,
+            text_documents=documents if text_enabled else None,
+            object_types=object_types,
+            **process_options,
         )
-        text_chunks, text_errors = _chunk_documents(documents, chunking)
+        _update_analysis_progress(
+            progress_job_id,
+            89,
+            "Preparing extracted text and detected objects...",
+        )
+        objects = [
+            record
+            for record in objects
+            if str(record.get("object_type", "")).casefold() in selected_types
+        ]
+        if text_enabled:
+            text_chunks, text_errors = _chunk_documents(documents, chunking)
+        else:
+            text_chunks, text_errors = [], []
+        _update_analysis_progress(
+            progress_job_id,
+            96,
+            "Saving analysis results...",
+        )
         state = {
-            "session_dir": session_dir,
+            "session_dir": str(session_dir),
             "objects": objects,
             "documents": documents,
+            "text_enabled": text_enabled,
             "text_chunks": text_chunks,
             "text_errors": text_errors,
             "chunking": dict(chunking),
@@ -157,12 +285,19 @@ def analyze_pdfs(
             "text_qa": [],
         }
         _sessions[session_id] = state
+        _save_session(session_id, state)
+        _update_analysis_progress(
+            progress_job_id,
+            100,
+            f"Analysis complete: {len(objects)} objects and {len(text_chunks)} text chunks.",
+            "complete",
+        )
         return _public_session(session_id, state)
 
 
 def get_session(session_id: str) -> dict[str, Any]:
     with _lock:
-        state = _sessions.get(session_id)
+        state = _get_state(session_id)
         if state is None:
             raise KeyError(f"Workbench session '{session_id}' was not found.")
         return _public_session(session_id, state)
@@ -173,14 +308,17 @@ def update_chunking(
     options: dict[str, Any],
 ) -> dict[str, Any]:
     with _lock:
-        state = _sessions.get(session_id)
+        state = _get_state(session_id)
         if state is None:
             raise KeyError(f"Workbench session '{session_id}' was not found.")
+        if not state.get("text_enabled", bool(state.get("documents") or state.get("text_chunks"))):
+            raise ValueError("Text was not selected for this analysis. Select Text and analyze the PDFs first.")
         chunks, errors = _chunk_documents(state["documents"], options)
         state["text_chunks"] = chunks
         state["text_errors"] = errors
         state["text_qa"] = []
         state["chunking"] = dict(options)
+        _save_session(session_id, state)
         return _public_session(session_id, state)
 
 
@@ -194,7 +332,7 @@ def generate_qa(
     credentials: dict[str, str],
 ) -> dict[str, Any]:
     with _lock:
-        state = _sessions.get(session_id)
+        state = _get_state(session_id)
         if state is None:
             raise KeyError(f"Workbench session '{session_id}' was not found.")
         if not generate_objects and not generate_text:
@@ -209,6 +347,11 @@ def generate_qa(
             raise ValueError("Select at least one object for object Q&A.")
         if generate_text and not state["text_chunks"]:
             raise ValueError("There are no text chunks to generate Q&A from.")
+        if generate_text and not state.get(
+            "text_enabled",
+            bool(state.get("documents") or state.get("text_chunks")),
+        ):
+            raise ValueError("Text was not selected for this analysis.")
 
         custom_logic.configure_azure_openai(
             credentials["api_key"],
@@ -226,6 +369,7 @@ def generate_qa(
             state["text_qa"] = custom_logic.generate_qa_for_text_chunks(
                 state["text_chunks"], text_question_count
             )
+        _save_session(session_id, state)
         return _public_session(session_id, state)
 
 
@@ -235,7 +379,7 @@ def get_object_image(
     part_index: int,
 ) -> Path:
     with _lock:
-        state = _sessions.get(session_id)
+        state = _get_state(session_id)
         if state is None:
             raise KeyError(f"Workbench session '{session_id}' was not found.")
         record = next(
@@ -256,7 +400,7 @@ def get_object_image(
 
 def build_workbook(session_id: str) -> bytes:
     with _lock:
-        state = _sessions.get(session_id)
+        state = _get_state(session_id)
         if state is None:
             raise KeyError(f"Workbench session '{session_id}' was not found.")
         if not state["qa_by_object"] and not state["text_qa"]:
@@ -298,14 +442,33 @@ def review_workbook(
                 deployment=custom_logic.MODEL_NAME,
             )
 
+        def review_aut_drift_answer(
+            question: str,
+            expected_answer: str,
+            actual_answer: str,
+            drift_traceback: str | None,
+            drift_differences: str | None,
+            contexts: list[dict[str, Any]],
+        ) -> dict[str, Any]:
+            return review_expected_answer(
+                question,
+                expected_answer,
+                contexts,
+                aut_actual_answer=actual_answer,
+                drift_traceback=drift_traceback,
+                drift_differences=drift_differences,
+                azure_client=custom_logic.client,
+                deployment=custom_logic.MODEL_NAME,
+            )
+
         return review(
             workbook_bytes,
             project_id,
             top_k,
             review_answer,
+            aut_drift_review_fn=review_aut_drift_answer,
         )
 
 
 def workbench_output_path(session_id: str) -> Path:
     return _output_root / session_id
-

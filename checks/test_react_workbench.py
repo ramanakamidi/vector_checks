@@ -9,6 +9,108 @@ from services import react_workbench
 
 
 class ReactWorkbenchTests(unittest.TestCase):
+    def test_qa_generation_job_reports_progress_and_completion(self) -> None:
+        progress_snapshots = []
+
+        def fake_generate_qa(_session_id, **kwargs):
+            callback = kwargs["progress_callback"]
+            callback(1, 2, "Generating single-chunk Q&A: 1 of 2 chunks complete")
+            callback(2, 2, "Generating single-chunk Q&A: 2 of 2 chunks complete")
+            callback(2, 2, "Saving generated Q&A to this session...", "finalizing")
+            progress_snapshots.append(
+                react_workbench.get_qa_generation_progress(job["job_id"])
+            )
+            return {"qa_records": [{}, {}, {}, {}]}
+
+        with (
+            patch.dict(react_workbench._qa_generation_progress, {}, clear=True),
+            patch.object(react_workbench, "generate_qa", side_effect=fake_generate_qa),
+        ):
+            job = react_workbench.create_qa_generation_job()
+            react_workbench.run_qa_generation_job(job["job_id"], "session", {})
+            progress = react_workbench.get_qa_generation_progress(job["job_id"])
+
+        self.assertEqual(progress["status"], "complete")
+        self.assertEqual(progress["progress"], 100)
+        self.assertEqual(progress["completed"], 2)
+        self.assertEqual(progress["total"], 2)
+        self.assertEqual(progress["message"], "Generated 4 question-and-answer pairs.")
+        self.assertEqual(progress_snapshots[0]["status"], "finalizing")
+        self.assertEqual(progress_snapshots[0]["progress"], 95)
+
+    def test_text_generation_can_combine_single_and_multi_hop_modes(self) -> None:
+        state = {
+            "objects": [],
+            "text_chunks": [
+                {"chunk_id": f"doc:{index}", "pdf_name": "sample.pdf", "source_text": f"Chunk {index}"}
+                for index in range(1, 4)
+            ],
+            "text_enabled": True,
+            "qa_by_object": {},
+            "text_qa": [],
+        }
+        single_pairs = [{"question": "Single-chunk question"}]
+        multi_hop_pairs = [{"question": "Multi-hop question"}]
+        credentials = {
+            "api_key": "test-key",
+            "endpoint": "https://example.test",
+            "deployment": "test-deployment",
+            "api_version": "test-version",
+        }
+        progress_updates = []
+
+        def generate_single(chunks, _question_count, progress_callback):
+            progress_callback(len(chunks), len(chunks))
+            return single_pairs
+
+        def generate_multi_hop(chunks, _chunk_count, _question_count, progress_callback):
+            progress_callback(1, 1)
+            return multi_hop_pairs
+
+        with (
+            patch.object(react_workbench, "_get_state", return_value=state),
+            patch.object(react_workbench, "_save_session"),
+            patch.object(react_workbench, "_public_session", return_value={}),
+            patch.object(react_workbench.custom_logic, "configure_azure_openai"),
+            patch.object(
+                react_workbench.custom_logic,
+                "generate_qa_for_text_chunks",
+                side_effect=generate_single,
+            ) as generate_single,
+            patch.object(
+                react_workbench.custom_logic,
+                "generate_qa_for_adjacent_text_chunks",
+                side_effect=generate_multi_hop,
+            ) as generate_multi_hop,
+        ):
+            react_workbench.generate_qa(
+                "session",
+                [],
+                False,
+                True,
+                5,
+                2,
+                credentials,
+                generate_single_chunk=True,
+                generate_multi_hop=True,
+                multi_hop_chunk_count=3,
+                multi_hop_question_count=1,
+                progress_callback=lambda completed, total, message, status="running": progress_updates.append(
+                    (completed, total, message, status)
+                ),
+            )
+
+        generate_single.assert_called_once()
+        generate_multi_hop.assert_called_once()
+        self.assertEqual(state["text_qa"], single_pairs + multi_hop_pairs)
+        self.assertEqual(progress_updates[-1], (
+            4,
+            4,
+            "Preparing generated Q&A results...",
+            "finalizing",
+        ))
+        self.assertIn("running", {update[3] for update in progress_updates})
+
     def test_saved_session_restores_object_images_after_memory_is_cleared(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             output_root = Path(temp_dir)

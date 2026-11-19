@@ -1,18 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Download, FileSearch, LoaderCircle, RefreshCw, Sparkles, X } from 'lucide-react';
+import { Check, Download, FileSearch, GitBranch, Layers, LoaderCircle, RefreshCw, Sparkles, X } from 'lucide-react';
 import AzureCredentialFields from '../components/AzureCredentialFields';
 import {
   analyzeWorkbench,
   createWorkbenchAnalysisJob,
+  createWorkbenchQAGenerationJob,
   downloadBase64File,
-  generateWorkbenchQA,
   getWorkbenchAnalysisProgress,
+  getWorkbenchQAGenerationProgress,
+  getWorkbenchSession,
   getWorkbenchWorkbook,
   updateWorkbenchChunking,
 } from '../api/workbench';
 import type {
   ChunkingOptions,
   WorkbenchAnalysisProgress,
+  WorkbenchGenerationProgress,
   WorkbenchObject,
 } from '../api/workbench';
 import { hasAzureCredentials } from '../contexts/AzureCredentialsContext';
@@ -67,10 +70,15 @@ export default function PdfWorkbenchPage() {
   const [chunking, setChunking] = useState(DEFAULT_CHUNKING);
   const [objectCount, setObjectCount] = useState(5);
   const [textCount, setTextCount] = useState(2);
+  const [generateSingleChunk, setGenerateSingleChunk] = useState(true);
+  const [generateMultiHop, setGenerateMultiHop] = useState(false);
+  const [multiHopChunkCount, setMultiHopChunkCount] = useState(2);
+  const [multiHopQuestionCount, setMultiHopQuestionCount] = useState(2);
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [analysisProgress, setAnalysisProgress] = useState<WorkbenchAnalysisProgress | null>(null);
+  const [generationProgress, setGenerationProgress] = useState<WorkbenchGenerationProgress | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -87,6 +95,7 @@ export default function PdfWorkbenchPage() {
     if (activeSessionIdRef.current === sessionId) return;
     activeSessionIdRef.current = sessionId;
     setChunking(normalizeChunking(session?.chunking));
+    setGenerationProgress(null);
   }, [session]);
 
   const hasPendingChunking = useMemo(
@@ -111,20 +120,32 @@ export default function PdfWorkbenchPage() {
         && chunking.min_sentences_per_chunk <= 20))
     && (chunking.technique !== 'semantic'
       || (chunking.semantic_threshold >= 0.05 && chunking.semantic_threshold <= 0.95));
+  const textSelected = selectedObjectTypes.includes('text');
+  const sessionHasText = Boolean(session?.text_enabled);
+  const canGenerateText = textSelected && sessionHasText;
   const validQuestionCounts = (!selectedIds.length || (
     Number.isInteger(objectCount)
     && objectCount >= 1
     && objectCount <= 20
   ))
-    && Number.isInteger(textCount)
-    && textCount >= 1
-    && textCount <= 3;
+    && (!canGenerateText || (
+      (!generateSingleChunk || (
+        Number.isInteger(textCount)
+        && textCount >= 1
+        && textCount <= 3
+      ))
+      && (!generateMultiHop || (
+        Number.isInteger(multiHopChunkCount)
+        && multiHopChunkCount >= 2
+        && multiHopChunkCount <= 10
+        && Number.isInteger(multiHopQuestionCount)
+        && multiHopQuestionCount >= 1
+        && multiHopQuestionCount <= 3
+      ))
+    ));
   const visibleObjects = session?.objects.filter(
     (item) => isObjectType(item.object_type) && selectedObjectTypes.includes(item.object_type),
   ) ?? [];
-  const textSelected = selectedObjectTypes.includes('text');
-  const sessionHasText = Boolean(session?.text_enabled);
-  const canGenerateText = textSelected && sessionHasText;
 
   const setTechnique = (technique: ChunkingOptions['technique']) => {
     setChunking({
@@ -218,19 +239,49 @@ export default function PdfWorkbenchPage() {
     setBusy('qa');
     setError('');
     setNotice('');
+    setGenerationProgress({
+      job_id: '',
+      status: 'running',
+      progress: 0,
+      completed: 0,
+      total: 0,
+      message: 'Starting Q&A generation...',
+    });
     try {
-      const current = await generateWorkbenchQA(session.session_id, {
+      let progress = await createWorkbenchQAGenerationJob(session.session_id, {
         object_ids: selectedIds,
         generate_objects: selectedIds.length > 0,
-        generate_text: canGenerateText,
+        generate_text: canGenerateText && (generateSingleChunk || generateMultiHop),
+        generate_single_chunk: generateSingleChunk,
+        generate_multi_hop: generateMultiHop,
         object_question_count: objectCount,
         text_question_count: textCount,
+        multi_hop_chunk_count: multiHopChunkCount,
+        multi_hop_question_count: multiHopQuestionCount,
         ...generationCredentials,
       });
+      setGenerationProgress(progress);
+      while (progress.status === 'running' || progress.status === 'finalizing') {
+        await new Promise<void>((resolve) => {
+          window.setTimeout(resolve, 700);
+        });
+        progress = await getWorkbenchQAGenerationProgress(progress.job_id);
+        setGenerationProgress(progress);
+      }
+      if (progress.status === 'failed') {
+        throw new Error(progress.message || 'Q&A generation failed.');
+      }
+      const current = await getWorkbenchSession(session.session_id);
       setSession(current);
       setNotice(`Q&A generated: ${current.qa_records.length} question-and-answer pairs.`);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Q&A generation failed.');
+      const message = cause instanceof Error ? cause.message : 'Q&A generation failed.';
+      setError(message);
+      setGenerationProgress((current) => current && ({
+        ...current,
+        status: 'failed',
+        message,
+      }));
     } finally {
       setBusy('');
     }
@@ -556,22 +607,155 @@ export default function PdfWorkbenchPage() {
             </div>
           </section>}
 
-          <section className="panel space-y-4">
-            <div className="section-title"><div className="icon-tile"><Sparkles size={18} /></div><div><h2>Generate Q&amp;A</h2><p>Generate Q&amp;A for checked objects{canGenerateText ? ' and extracted text chunks' : ''}.</p></div></div>
-            <div className="flex flex-wrap gap-x-6 gap-y-3">
-              {selectedIds.length > 0 && <label className="field-label compact-field">Questions per selected object
-                <input type="number" min={1} max={20} step={1} value={objectCount} onChange={(event) => setObjectCount(Number(event.target.value))} />
-              </label>}
-              {canGenerateText && <label className="field-label compact-field">Questions per text chunk
-                <input type="number" min={1} max={3} step={1} value={textCount} onChange={(event) => setTextCount(Number(event.target.value))} />
-              </label>}
+          <section className="panel qa-generation-panel">
+            <div className="section-title">
+              <div className="icon-tile"><Sparkles size={18} /></div>
+              <div>
+                <h2>Generate Q&amp;A</h2>
+                <p>Choose how text questions are created{selectedIds.length ? ' and configure selected objects' : ''}.</p>
+              </div>
             </div>
+
+            {selectedIds.length > 0 && (
+              <div className="qa-object-settings">
+                <div>
+                  <strong>Selected objects</strong>
+                  <span>{selectedIds.length} object{selectedIds.length === 1 ? '' : 's'} selected</span>
+                </div>
+                <label className="qa-number-field compact-field">
+                  <span>Questions per object</span>
+                  <input type="number" min={1} max={20} step={1} value={objectCount} onChange={(event) => setObjectCount(Number(event.target.value))} />
+                </label>
+              </div>
+            )}
+
+            {canGenerateText && (
+              <div className="qa-mode-section">
+                <div className="qa-mode-section-heading">
+                  <div>
+                    <h3>Text generation modes</h3>
+                    <p>Select either approach, or combine both in one run.</p>
+                  </div>
+                  <span className="qa-mode-selection-hint">Choose one or both</span>
+                </div>
+                <div className="qa-mode-grid">
+                  <label className={`qa-mode-card ${generateSingleChunk ? 'is-selected' : ''}`}>
+                    <input
+                      type="checkbox"
+                      checked={generateSingleChunk}
+                      onChange={(event) => setGenerateSingleChunk(event.target.checked)}
+                    />
+                    <span className="qa-mode-icon"><Layers size={19} /></span>
+                    <span className="qa-mode-copy">
+                      <strong>Single chunk</strong>
+                      <small>Generate questions from each chunk on its own.</small>
+                    </span>
+                    <span className="qa-mode-check"><Check size={15} /></span>
+                  </label>
+                  <label className={`qa-mode-card ${generateMultiHop ? 'is-selected' : ''}`}>
+                    <input
+                      type="checkbox"
+                      checked={generateMultiHop}
+                      onChange={(event) => setGenerateMultiHop(event.target.checked)}
+                    />
+                    <span className="qa-mode-icon qa-mode-icon-multihop"><GitBranch size={19} /></span>
+                    <span className="qa-mode-copy">
+                      <strong>Multi-hop</strong>
+                      <small>Combine adjacent chunks for questions that need both.</small>
+                    </span>
+                    <span className="qa-mode-check"><Check size={15} /></span>
+                  </label>
+                </div>
+
+                {(generateSingleChunk || generateMultiHop) ? (
+                  <div className="qa-settings-grid">
+                    {generateSingleChunk && (
+                      <div className="qa-config-card">
+                        <div className="qa-config-heading">
+                          <span className="qa-config-number">01</span>
+                          <div><strong>Single-chunk settings</strong><small>Generated independently for each chunk</small></div>
+                        </div>
+                        <label className="qa-number-field">
+                          <span>Q&amp;A pairs per chunk</span>
+                          <input type="number" min={1} max={3} step={1} value={textCount} onChange={(event) => setTextCount(Number(event.target.value))} />
+                        </label>
+                      </div>
+                    )}
+                    {generateMultiHop && (
+                      <div className="qa-config-card qa-config-card-multihop">
+                        <div className="qa-config-heading">
+                          <span className="qa-config-number">02</span>
+                          <div><strong>Multi-hop settings</strong><small>Uses same-document adjacent chunks</small></div>
+                        </div>
+                        <div className="qa-multihop-fields">
+                          <label className="qa-number-field">
+                            <span>Chunks per group</span>
+                            <input type="number" min={2} max={10} step={1} value={multiHopChunkCount} onChange={(event) => setMultiHopChunkCount(Number(event.target.value))} />
+                          </label>
+                          <label className="qa-number-field">
+                            <span>Q&amp;A pairs per group</span>
+                            <input type="number" min={1} max={3} step={1} value={multiHopQuestionCount} onChange={(event) => setMultiHopQuestionCount(Number(event.target.value))} />
+                          </label>
+                        </div>
+                        <p className="qa-config-help">Each group advances by one chunk. Groups never cross PDF boundaries.</p>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <p className="qa-mode-empty">Select at least one text mode to generate text Q&amp;A.</p>
+                )}
+              </div>
+            )}
+
             {canGenerateText && hasPendingChunking && <p className="alert-warning">Apply the changed chunk settings before generating text Q&amp;A.</p>}
-            <button className="button-primary" onClick={runGeneration}
-              disabled={!hasAzureCredentials(generationCredentials) || !validQuestionCounts || !!busy || (!selectedIds.length && !canGenerateText) || (canGenerateText && session.text_chunks.length > 0 && hasPendingChunking)}>
-              {busy === 'qa' ? <LoaderCircle className="animate-spin" size={16} /> : <Sparkles size={16} />}
-              {busy === 'qa' ? 'Generating Q&A…' : 'Generate Q&A'}
-            </button>
+            <div className="qa-generation-actions">
+              <button className="button-primary" onClick={runGeneration}
+                disabled={!hasAzureCredentials(generationCredentials) || !validQuestionCounts || !!busy || (!selectedIds.length && (!canGenerateText || (!generateSingleChunk && !generateMultiHop))) || (canGenerateText && session.text_chunks.length > 0 && hasPendingChunking)}>
+                {busy === 'qa' ? <LoaderCircle className="animate-spin" size={16} /> : <Sparkles size={16} />}
+                {busy === 'qa' ? 'Generating Q&A…' : 'Generate Q&A'}
+              </button>
+              {!hasAzureCredentials(generationCredentials) && <span>Configure Azure OpenAI credentials to start generation.</span>}
+            </div>
+            {generationProgress && (
+              <div className={`qa-progress-card qa-progress-${generationProgress.status}`} role="status" aria-live="polite">
+                <div className="qa-progress-icon">
+                  {generationProgress.status === 'running' || generationProgress.status === 'finalizing'
+                    ? <LoaderCircle size={20} className="animate-spin" />
+                    : generationProgress.status === 'complete'
+                      ? <Check size={20} />
+                      : <X size={20} />}
+                </div>
+                <div className="qa-progress-content">
+                  <div className="qa-progress-heading">
+                    <div>
+                      <span className="qa-progress-eyebrow">
+                        {generationProgress.status === 'running'
+                          ? 'Generation in progress'
+                          : generationProgress.status === 'finalizing'
+                            ? 'Saving results'
+                            : `Generation ${generationProgress.status}`}
+                      </span>
+                      <p>{generationProgress.message}</p>
+                    </div>
+                    <strong>{generationProgress.progress}%</strong>
+                  </div>
+                  <div
+                    className="qa-progress-track"
+                    role="progressbar"
+                    aria-label="Q&A generation progress"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={generationProgress.progress}
+                  >
+                    <span style={{ width: `${generationProgress.progress}%` }} />
+                  </div>
+                  <div className="qa-progress-footer">
+                    <span>{generationProgress.total ? `${generationProgress.completed} of ${generationProgress.total} steps` : 'Preparing generation steps'}</span>
+                    <span>Progress updates as each object, chunk, or group finishes</span>
+                  </div>
+                </div>
+              </div>
+            )}
             {session.qa_records.length > 0 && (
               <div className="overflow-x-auto">
                 <table className="data-table">

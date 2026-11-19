@@ -400,16 +400,7 @@ export async function uploadProjectPdfs(
   files: File[],
   jobId?: string,
   chunking?: ChunkingOptions,
-): Promise<{
-  status: string;
-  job_id?: string;
-  files: Array<Record<string, unknown>>;
-  errors: Array<Record<string, unknown>>;
-  chunks_ingested: number;
-  image_records_ingested: number;
-  text_records_ingested: number;
-  table_records_ingested: number;
-}> {
+): Promise<{ status: 'accepted'; job_id: string }> {
   const formData = new FormData();
   files.forEach((file) => formData.append('files', file));
   if (jobId) formData.append('job_id', jobId);
@@ -423,6 +414,17 @@ export async function uploadProjectPdfs(
     throw new Error(`API ${response.status}: ${body}`);
   }
   return response.json();
+}
+
+export interface PdfIngestionResult {
+  status: string;
+  job_id: string;
+  files: Array<Record<string, unknown>>;
+  errors: Array<Record<string, unknown>>;
+  chunks_ingested: number;
+  image_records_ingested: number;
+  text_records_ingested: number;
+  table_records_ingested: number;
 }
 
 export interface PdfIngestionProgress {
@@ -445,6 +447,7 @@ export interface PdfIngestionProgress {
   text_records_ingested?: number;
   table_records_ingested?: number;
   errors?: Array<Record<string, unknown>>;
+  result?: PdfIngestionResult;
 }
 
 export async function getPdfIngestionProgress(

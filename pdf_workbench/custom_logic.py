@@ -2196,8 +2196,12 @@ def chunk_document_text(
         })
     return chunks
 
-def generate_qa_for_text_chunk(chunk: dict[str, Any], num_qa: int = 2) -> list[dict[str, Any]]:
-    """Generate grounded Q&A pairs from one prose chunk using Azure OpenAI."""
+def generate_qa_for_text_chunk(
+    chunk: dict[str, Any],
+    num_qa: int = 2,
+    multi_hop: bool = False,
+) -> list[dict[str, Any]]:
+    """Generate grounded Q&A pairs from one chunk or a multi-chunk group."""
     if not 1 <= num_qa <= 3:
         raise ValueError("Text Q&A generation supports 1 to 3 questions per chunk.")
     if client is None or MODEL_NAME is None:
@@ -2205,6 +2209,8 @@ def generate_qa_for_text_chunk(chunk: dict[str, Any], num_qa: int = 2) -> list[d
     source_text = str(chunk.get("source_text") or "").strip()
     if not source_text:
         return []
+    if multi_hop and len(chunk.get("source_chunks", [])) < 2:
+        raise ValueError("Multi-hop Q&A requires evidence from at least two chunks.")
     section = str(chunk.get("section") or "").strip()
     categories = ", ".join(CATEGORY_DEFINITIONS["text"])
     system_prompt = f"""Generate at most {num_qa} distinct natural user questions
@@ -2223,7 +2229,16 @@ invent facts, rely on outside knowledge, or refer to "the excerpt" in questions.
 Use one category from: {categories}.
 Return JSON only with this shape:
 {{"pairs":[{{"question":"...","category":"...","expected_answer":"..."}}]}}"""
-    evidence = {"document_text": source_text}
+    if multi_hop:
+        system_prompt += """
+For every question, require combining facts from at least two different
+document chunks. Skip questions answerable from only one chunk."""
+        evidence = {
+            "document_chunks": chunk.get("source_chunks", []),
+            "document_text": source_text,
+        }
+    else:
+        evidence = {"document_text": source_text}
     if section:
         evidence["document_section"] = section
     user_content = json.dumps(evidence, ensure_ascii=False)
@@ -2289,6 +2304,8 @@ def generate_qa_for_text_chunks(
     seen: set[tuple[str, str]] = set()
     generated: list[dict[str, Any]] = []
     for index, chunk in enumerate(chunks, start=1):
+        if progress_callback:
+            progress_callback(index - 1, len(chunks))
         for pair in generate_qa_for_text_chunk(chunk, num_qa):
             key = (
                 str(chunk.get("pdf_name") or "").casefold(),
@@ -2301,6 +2318,109 @@ def generate_qa_for_text_chunks(
         if progress_callback:
             progress_callback(index, len(chunks))
     return generated
+
+
+def generate_qa_for_adjacent_text_chunks(
+    chunks: list[dict[str, Any]],
+    chunks_per_group: int,
+    num_qa: int = 2,
+    progress_callback=None,
+) -> list[dict[str, Any]]:
+    """Generate multi-hop Q&A from overlapping adjacent chunk groups."""
+    if not 2 <= chunks_per_group <= 10:
+        raise ValueError("Multi-hop Q&A requires 2 to 10 adjacent chunks per group.")
+    if not 1 <= num_qa <= 3:
+        raise ValueError("Multi-hop Q&A generation supports 1 to 3 questions per group.")
+
+    groups = get_adjacent_text_chunk_groups(chunks, chunks_per_group)
+    if not groups:
+        raise ValueError(
+            f"No groups of {chunks_per_group} adjacent text chunks were found within one PDF."
+        )
+
+    seen: set[tuple[str, str]] = set()
+    generated: list[dict[str, Any]] = []
+    for index, group in enumerate(groups, start=1):
+        if progress_callback:
+            progress_callback(index - 1, len(groups))
+        source_chunks = [
+            {
+                "chunk_id": chunk.get("chunk_id"),
+                "section": chunk.get("section") or "",
+                "document_text": str(chunk.get("source_text") or ""),
+            }
+            for chunk in group
+        ]
+        sections = list(dict.fromkeys(
+            str(chunk.get("section") or "").strip()
+            for chunk in group
+            if str(chunk.get("section") or "").strip()
+        ))
+        source_chunk_ids = [
+            chunk.get("chunk_id")
+            for chunk in group
+            if chunk.get("chunk_id") is not None
+        ]
+        pages = []
+        for chunk in group:
+            pages.extend(
+                chunk.get("pages")
+                or ([chunk["page_no"]] if chunk.get("page_no") is not None else [])
+            )
+        pages = list(dict.fromkeys(pages))
+        combined = {
+            **group[0],
+            "source_text": "\n\n".join(
+                source_chunk["document_text"]
+                for source_chunk in source_chunks
+                if source_chunk["document_text"]
+            ),
+            "source_chunks": source_chunks,
+            "source_chunk_ids": source_chunk_ids,
+            "section": " | ".join(sections),
+            "pages": pages,
+            "page_no": (
+                pages[0]
+                if len(pages) == 1
+                else ", ".join(str(page) for page in pages) or None
+            ),
+            "multi_hop": True,
+            "multi_hop_chunk_count": chunks_per_group,
+        }
+        for pair in generate_qa_for_text_chunk(combined, num_qa, multi_hop=True):
+            key = (
+                str(combined.get("pdf_name") or "").casefold(),
+                re.sub(r"\W+", " ", pair["question"].casefold()).strip(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            generated.append({**combined, **pair})
+        if progress_callback:
+            progress_callback(index, len(groups))
+    return generated
+
+
+def get_adjacent_text_chunk_groups(
+    chunks: list[dict[str, Any]],
+    chunks_per_group: int,
+) -> list[list[dict[str, Any]]]:
+    """Return adjacent, non-empty text chunk groups that stay within one PDF."""
+    if not 2 <= chunks_per_group <= 10:
+        raise ValueError("Multi-hop Q&A requires 2 to 10 adjacent chunks per group.")
+
+    groups = []
+    for start in range(max(0, len(chunks) - chunks_per_group + 1)):
+        group = chunks[start:start + chunks_per_group]
+        pdf_name = str(group[0].get("pdf_name") or "")
+        if all(
+            str(chunk.get("pdf_name") or "") == pdf_name
+            and str(chunk.get("source_text") or "").strip()
+            for chunk in group
+        ):
+            groups.append(group)
+    return groups
+
 
 EXCEL_PATH = str(Path(output_dir) / "object_qa_validation.xlsx")
 CHARACTERISTICS_JSON_PATH = str(Path(output_dir) / "characteristics.json")
@@ -2763,9 +2883,16 @@ def build_qa_records(
             "pdf_name": pair.get("pdf_name"),
             "page_no": pair.get("page_no"),
             "analysis_mode": (
-                f"text chunking: {pair.get('chunk_technique')}"
-                if pair.get("chunk_technique")
-                else "text chunking"
+                (
+                    f"text chunking: {pair.get('chunk_technique')}"
+                    if pair.get("chunk_technique")
+                    else "text chunking"
+                )
+                + (
+                    f"; multi-hop ({pair.get('multi_hop_chunk_count')} adjacent chunks)"
+                    if pair.get("multi_hop")
+                    else ""
+                )
             ),
             "object_type": "text",
             "object_no": None,
@@ -2784,7 +2911,11 @@ def build_qa_records(
             "reason": "",
             "score": "",
             "source_type": "text",
-            "source_id": pair.get("chunk_id"),
+            "source_id": (
+                json.dumps(pair.get("source_chunk_ids"), ensure_ascii=False)
+                if pair.get("source_chunk_ids")
+                else pair.get("chunk_id")
+            ),
             "source_section": pair.get("section") or "",
             "source_text": pair.get("source_text") or "",
             "source_pages": json.dumps(

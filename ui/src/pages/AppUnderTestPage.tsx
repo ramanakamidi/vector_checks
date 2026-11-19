@@ -21,13 +21,13 @@ import {
   uploadProjectPdfs,
   getPdfIngestionProgress,
 } from '../api/client';
-import type { PdfIngestionProgress } from '../api/client';
+import type { PdfIngestionProgress, PdfIngestionResult } from '../api/client';
 import type { MockAutStatus, ProjectVectorRecord } from '../api/types';
 import type { ChunkingOptions } from '../api/workbench';
 import AzureCredentialFields from '../components/AzureCredentialFields';
 
 type AutStatus = MockAutStatus & { outdated?: boolean; prompt_version?: string };
-type IngestionResult = Awaited<ReturnType<typeof uploadProjectPdfs>>;
+type IngestionResult = PdfIngestionResult;
 const VECTOR_RECORDS_PAGE_SIZE = 50;
 const DEFAULT_CHUNKING: ChunkingOptions = {
   technique: 'sentence',
@@ -503,21 +503,24 @@ export default function AppUnderTestPage() {
                   batch_total: 0,
                   elapsed_seconds: 0,
                 });
-                const poll = window.setInterval(async () => {
-                  try {
-                    setIngestionProgress(await getPdfIngestionProgress(projectId, jobId));
-                  } catch {
-                    // The job may be initialized immediately after the POST starts.
-                  }
-                }, 750);
-                let result: IngestionResult;
-                try {
-                  result = await uploadProjectPdfs(projectId, pdfs, jobId, chunking);
-                  setIngestionProgress(await getPdfIngestionProgress(projectId, jobId));
-                } finally {
-                  window.clearInterval(poll);
+                const accepted = await uploadProjectPdfs(projectId, pdfs, jobId, chunking);
+                let progress = await getPdfIngestionProgress(projectId, accepted.job_id);
+                setIngestionProgress(progress);
+                while (progress.status === 'running') {
+                  await new Promise((resolve) => window.setTimeout(resolve, 1000));
+                  progress = await getPdfIngestionProgress(projectId, accepted.job_id);
+                  setIngestionProgress(progress);
                 }
-                setIngestion(result);
+                if (progress.status === 'failed') {
+                  const details = progress.errors?.length
+                    ? `: ${JSON.stringify(progress.errors)}`
+                    : '';
+                  throw new Error(`${progress.message}${details}`);
+                }
+                if (!progress.result) {
+                  throw new Error('PDF ingestion finished without returning a result.');
+                }
+                setIngestion(progress.result);
                 setPdfs([]);
               })}
             >

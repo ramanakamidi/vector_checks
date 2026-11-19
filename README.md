@@ -163,7 +163,11 @@ Test Data Generation `.xlsx` workbook at the top to run question-based Neighbor
 Consistency, Duplicate Detection, AUT-Vector Drift, and per-question Vector
 Integrity or Metadata Completeness. The latter two inspect the top three
 retrieved records for each question. Neighbor Consistency, Duplicate Detection,
-and Drift use the configured top-k. Drift processes each question separately:
+and Drift use the configured top-k. Hit@k evaluates each workbook question
+against the top 50 retrieved text, table, image, and graph records; the workbook
+must include `object_type`, `chunk`, and `object_image_paths` columns. It reports
+the matching rank and Hit@1/3/5/10 for each question without averages. Drift
+processes each question separately:
 the vector database retrieves top-k records, the Mock AUT uses those exact
 records to generate its actual answer, and the Azure OpenAI judge evaluates
 that answer against the question and retrieved evidence. Per-question actual
@@ -211,6 +215,7 @@ The project-based **Execution** workflow supports these check categories:
 |---|---|
 | Vector integrity | Without a workbook, checks that scanned vectors have a consistent dimension. With a workbook, checks dimensions and basic vector validity (empty, non-finite, or zero-magnitude vectors) for the top three retrieved records per question. |
 | Neighbor consistency | Per workbook question, retrieves a configurable top-k, checks every distinct pair among the retrieved records, and reports pair-level reciprocal-neighbor results. The direct project-check API can use automatically sampled adjacent pairs without workbook questions. |
+| Hit@k (per question) | Embeds each workbook question using the project's query embedding model, retrieves the top 50 mixed text, table, image, and graph records, and reports the exact-match rank and Hit@1/3/5/10. Requires `question`, `object_type`, `chunk`, and `object_image_paths` workbook columns; reports no averages. |
 | AUT-Vector Drift | For each workbook question, retrieves top-k vector records, gets the Mock AUT's actual answer from those records, and has an Azure OpenAI judge score the answer against the question and evidence; reports actual answers, retrieved records, a 0–1 drift score, differences, and evidence-based trace. |
 | Duplicate detection | With a workbook, compares each question's retrieved records and reports per-question similarity candidates within a configurable cosine range (default 0.65–0.98). Without workbook questions, the direct project-check API samples the collection. Candidates are not automatically labeled duplicates. |
 | Metadata completeness | Without a workbook, checks selected required fields across the collection. With a workbook, checks each question's top three retrieved records for missing or empty required fields and shows record-level results. |
@@ -357,7 +362,7 @@ groups include:
 | `/api/projects/{project_id}/datasets*` | Dataset generation, browsing, and deletion. |
 | `/api/projects/{project_id}/execute*` | Run, inspect, delete executions, and download HTML reports. |
 | `/api/projects/{project_id}/run-vector-checks` | Run selected checks against the project's configured vector store. |
-| `/api/projects/{project_id}/run-workbook-checks` | Run workbook-question checks, including per-question Neighbor Consistency and Duplicate Detection, and optional AUT-Vector Drift; returns an annotated workbook when Drift is selected. |
+| `/api/projects/{project_id}/run-workbook-checks` | Run workbook-question checks, including per-question Neighbor Consistency, Duplicate Detection, Hit@k, and optional AUT-Vector Drift; returns an annotated workbook when Drift is selected. |
 | `/api/projects/{project_id}/visualization-data` | Project UMAP/HDBSCAN data; the `with-qa` route accepts a workbook and links Q&A. |
 | `/api/workbench/*` | Analyze PDFs, apply chunking, generate Q&A, fetch crops, and export workbooks. |
 | `/api/answer-improvement/review` | Review a workbook against project evidence. |

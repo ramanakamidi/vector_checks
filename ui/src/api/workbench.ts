@@ -31,7 +31,7 @@ export interface WorkbenchQA {
   expected_answer: string;
   pdf_name: string;
   object_type: string;
-  page_no: number | null;
+  page_no: number | string | null;
   category: string;
   source_type: string;
   source_section: string;
@@ -53,6 +53,28 @@ export interface WorkbenchAnalysisProgress {
   status: 'running' | 'complete' | 'failed';
   progress: number;
   message: string;
+}
+
+export interface WorkbenchGenerationProgress extends Omit<WorkbenchAnalysisProgress, 'status'> {
+  status: 'running' | 'finalizing' | 'complete' | 'failed';
+  completed: number;
+  total: number;
+}
+
+export interface WorkbenchQAGenerationRequest {
+  object_ids: string[];
+  generate_objects: boolean;
+  generate_text: boolean;
+  generate_single_chunk: boolean;
+  generate_multi_hop: boolean;
+  object_question_count: number;
+  text_question_count: number;
+  multi_hop_chunk_count: number;
+  multi_hop_question_count: number;
+  api_key: string;
+  endpoint: string;
+  deployment: string;
+  api_version: string;
 }
 
 async function responseJson<T>(response: Response): Promise<T> {
@@ -133,13 +155,7 @@ export async function updateWorkbenchChunking(
 
 export async function generateWorkbenchQA(
   sessionId: string,
-  payload: {
-    object_ids: string[];
-    generate_objects: boolean;
-    generate_text: boolean;
-    object_question_count: number;
-    text_question_count: number;
-  } & AzureCredentials,
+  payload: WorkbenchQAGenerationRequest,
 ): Promise<WorkbenchSession> {
   return responseJson<WorkbenchSession>(
     await fetch(`/api/workbench/${encodeURIComponent(sessionId)}/qa`, {
@@ -147,6 +163,27 @@ export async function generateWorkbenchQA(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     }),
+  );
+}
+
+export async function createWorkbenchQAGenerationJob(
+  sessionId: string,
+  payload: WorkbenchQAGenerationRequest,
+): Promise<WorkbenchGenerationProgress> {
+  return responseJson<WorkbenchGenerationProgress>(
+    await fetch(`/api/workbench/${encodeURIComponent(sessionId)}/qa-jobs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+  );
+}
+
+export async function getWorkbenchQAGenerationProgress(
+  jobId: string,
+): Promise<WorkbenchGenerationProgress> {
+  return responseJson<WorkbenchGenerationProgress>(
+    await fetch(`/api/workbench/qa-jobs/${encodeURIComponent(jobId)}`),
   );
 }
 

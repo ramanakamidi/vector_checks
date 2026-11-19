@@ -15,6 +15,7 @@ from pdf_workbench.custom_logic import (
     build_qa_records,
     chunk_document_text,
     extract_objects_from_pdf,
+    generate_qa_for_adjacent_text_chunks,
     generate_qa_for_text_chunk,
 )
 
@@ -302,6 +303,124 @@ test document.
             "document_text": "The text content.",
             "document_section": "Introduction",
         })
+
+    def test_multi_hop_generation_uses_adjacent_groups_without_crossing_pdfs(self) -> None:
+        chunks = [
+            {"chunk_id": "a:1", "pdf_name": "a.pdf", "source_text": "A1", "page_no": 2, "pages": [2]},
+            {"chunk_id": "a:2", "pdf_name": "a.pdf", "source_text": "A2", "page_no": 3, "pages": [3]},
+            {"chunk_id": "a:3", "pdf_name": "a.pdf", "source_text": "A3", "page_no": 3, "pages": [3]},
+            {"chunk_id": "b:1", "pdf_name": "b.pdf", "source_text": "B1", "page_no": 7, "pages": [7]},
+            {"chunk_id": "b:2", "pdf_name": "b.pdf", "source_text": "B2", "page_no": 7, "pages": [7]},
+        ]
+
+        def generate(chunk, _num_qa, multi_hop):
+            self.assertTrue(multi_hop)
+            return [{
+                "question": f"Question about {chunk['source_text']}",
+                "expected_answer": "Combined answer",
+            }]
+
+        with patch.object(
+            custom_logic,
+            "generate_qa_for_text_chunk",
+            side_effect=generate,
+        ) as generate_chunk:
+            pairs = generate_qa_for_adjacent_text_chunks(
+                chunks,
+                chunks_per_group=2,
+                num_qa=1,
+            )
+
+        self.assertEqual(generate_chunk.call_count, 3)
+        self.assertEqual(
+            [pair["source_text"] for pair in pairs],
+            ["A1\n\nA2", "A2\n\nA3", "B1\n\nB2"],
+        )
+        self.assertEqual(
+            [pair["source_chunk_ids"] for pair in pairs],
+            [["a:1", "a:2"], ["a:2", "a:3"], ["b:1", "b:2"]],
+        )
+        self.assertEqual([pair["page_no"] for pair in pairs], ["2, 3", 3, 7])
+        self.assertEqual([pair["pages"] for pair in pairs], [[2, 3], [3], [7]])
+        with self.assertRaisesRegex(ValueError, "No groups"):
+            generate_qa_for_adjacent_text_chunks(
+                [
+                    {"pdf_name": "a.pdf", "source_text": "A1"},
+                    {"pdf_name": "b.pdf", "source_text": "B1"},
+                ],
+                chunks_per_group=2,
+                num_qa=1,
+            )
+
+    def test_multi_hop_prompt_requires_evidence_from_multiple_chunks(self) -> None:
+        create = Mock(return_value=SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"pairs":[]}'))],
+        ))
+        mock_client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=create),
+            ),
+        )
+        with (
+            patch.object(custom_logic, "client", mock_client),
+            patch.object(custom_logic, "MODEL_NAME", "test-deployment"),
+            patch.object(
+                custom_logic,
+                "_parse_qa_with_category",
+                return_value={"pairs": []},
+            ),
+        ):
+            generate_qa_for_text_chunk(
+                {
+                    "source_text": "First fact.\n\nSecond fact.",
+                    "source_chunks": [
+                        {"chunk_id": "doc:1", "document_text": "First fact."},
+                        {"chunk_id": "doc:2", "document_text": "Second fact."},
+                    ],
+                },
+                num_qa=1,
+                multi_hop=True,
+            )
+
+        system_message = create.call_args.kwargs["messages"][0]["content"]
+        self.assertIn("at least two different", system_message)
+        user_message = create.call_args.kwargs["messages"][1]["content"]
+        evidence = json.loads(user_message.split(":\n", 1)[1])
+        self.assertEqual(len(evidence["document_chunks"]), 2)
+
+    def test_multi_hop_export_keeps_all_source_chunks_in_excel_chunk_column(self) -> None:
+        combined_source = "First source chunk.\n\nSecond source chunk."
+        text_qa = [{
+            "pdf_name": "sample.pdf",
+            "section": "Introduction | Details",
+            "chunk_id": "doc-1:text:1",
+            "source_chunk_ids": ["doc-1:text:1", "doc-1:text:2"],
+            "source_text": combined_source,
+            "chunk_technique": "sentence",
+            "multi_hop": True,
+            "multi_hop_chunk_count": 2,
+            "page_no": "2, 3",
+            "pages": [2, 3],
+            "question": "How are the two facts related?",
+            "expected_answer": "They describe related details.",
+            "category": "comparison",
+        }]
+
+        row = build_qa_records([], text_qa=text_qa)[0]
+        self.assertEqual(row["chunk"], combined_source)
+        self.assertEqual(row["page_no"], "2, 3")
+        self.assertEqual(row["source_id"], '["doc-1:text:1", "doc-1:text:2"]')
+        self.assertEqual(row["source_pages"], "[2, 3]")
+        self.assertIn("multi-hop (2 adjacent chunks)", row["analysis_mode"])
+        from io import BytesIO
+        from openpyxl import load_workbook
+
+        worksheet = load_workbook(BytesIO(build_excel_bytes([], text_qa=text_qa))).active
+        headers = {
+            cell.value: cell.column
+            for cell in worksheet[1]
+        }
+        self.assertEqual(worksheet.cell(row=2, column=headers["page_no"]).value, "2, 3")
 
     def test_rejects_invalid_chunking_settings(self) -> None:
         with self.assertRaisesRegex(ValueError, "overlap"):

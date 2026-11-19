@@ -11,6 +11,57 @@ with patch.dict(sys.modules, {"torch": types.ModuleType("torch")}):
 
 
 class ServerApiRegressionTests(unittest.TestCase):
+    def test_pdf_ingestion_returns_before_background_processing_finishes(self) -> None:
+        class FakeUpload:
+            filename = "sample.pdf"
+
+            async def read(self) -> bytes:
+                return b"%PDF sample"
+
+            async def close(self) -> None:
+                pass
+
+        outcome = {
+            "status": "ingested",
+            "pdf_name": "sample.pdf",
+            "chunks_ingested": 2,
+            "image_records_ingested": 1,
+            "text_records_ingested": 1,
+            "table_records_ingested": 0,
+            "collection_name": "project_collection",
+        }
+        background_tasks = server.BackgroundTasks()
+        with (
+            patch.object(server._pm, "get_project_dir", return_value="C:/projects/project"),
+            patch.dict(server.PDF_INGESTION_JOBS, {}, clear=True),
+            patch.object(server, "ingest_pdf", return_value=outcome) as ingest_pdf,
+        ):
+            response = asyncio.run(
+                server.ingest_project_pdfs(
+                    "project",
+                    background_tasks,
+                    [FakeUpload()],
+                    "job-1",
+                    "{}",
+                )
+            )
+
+            self.assertEqual(response, {"status": "accepted", "job_id": "job-1"})
+            ingest_pdf.assert_not_called()
+            self.assertEqual(
+                server.PDF_INGESTION_JOBS["job-1"]["status"],
+                "running",
+            )
+
+            asyncio.run(background_tasks())
+            progress = asyncio.run(
+                server.get_pdf_ingestion_progress("project", "job-1")
+            )
+
+        self.assertEqual(progress["status"], "complete")
+        self.assertEqual(progress["result"]["chunks_ingested"], 2)
+        ingest_pdf.assert_called_once()
+
     def test_project_vector_records_returns_full_text_for_requested_page(self) -> None:
         collection = Mock()
         collection.count.return_value = 3

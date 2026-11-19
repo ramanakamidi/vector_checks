@@ -19,6 +19,7 @@ const CHECKS = [
   { id: 'duplicate_detection', label: 'Duplicate similarity candidates', description: 'For each workbook question, compare the retrieved records and flag high-similarity pairs.' },
   { id: 'metadata_completeness', label: 'Metadata completeness', description: 'Without a workbook, check required fields across the collection; with a workbook, inspect the top three retrieved records per question.' },
   { id: 'negative_query_similarity', label: 'Negative queries (off-topic)', description: 'Check that unrelated questions receive low nearest-chunk cosine scores.' },
+  { id: 'hit_at_k', label: 'Hit@k (per question)', description: 'For each workbook question, retrieve the top 50 text, table, image, and graph records and report the correct item’s rank plus Hit@1/3/5/10.' },
 ] as const;
 
 const OFF_TOPIC_CATEGORIES = [
@@ -275,6 +276,55 @@ function CheckStatus({ value, label }: { value: string; label?: string }) {
         ? 'question-check-status-error'
         : 'question-check-status-info';
   return <span className={`question-check-status ${statusClass}`}>{label ?? value}</span>;
+}
+
+function HitAtKResults({ result }: { result: Record<string, unknown> }) {
+  const detail = asRecord(result.detail);
+  const rows = asRecords(detail?.question_results);
+  if (!detail) return null;
+
+  return (
+    <section className="question-check-results">
+      <div className="question-check-heading">
+        <div>
+          <h3>Hit@k by question</h3>
+          <p>Top {String(detail.top_k ?? 50)} retrieved records; no averages.</p>
+        </div>
+      </div>
+      {rows.length > 0 ? (
+        <div className="overflow-x-auto">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Question</th>
+                <th>Type</th>
+                <th>Rank</th>
+                <th>Hit@1</th>
+                <th>Hit@3</th>
+                <th>Hit@5</th>
+                <th>Hit@10</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, index) => (
+                <tr key={`${String(row.row ?? index)}-${index}`}>
+                  <td>{String(row.question ?? '')}</td>
+                  <td>{String(row.type ?? '')}</td>
+                  <td>{String(row.rank ?? 'not found')}</td>
+                  <td>{String(row['hit@1'] ?? 0)}</td>
+                  <td>{String(row['hit@3'] ?? 0)}</td>
+                  <td>{String(row['hit@5'] ?? 0)}</td>
+                  <td>{String(row['hit@10'] ?? 0)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <p className="question-check-empty">No per-question Hit@k results were returned.</p>
+      )}
+    </section>
+  );
 }
 
 function CheckResultModal({
@@ -1153,7 +1203,8 @@ export default function ExecutionPage() {
 
   const workbookQuestionsRequired = selectedChecks.includes('neighbor_consistency')
     || selectedChecks.includes('aut_vector_drift')
-    || selectedChecks.includes('duplicate_detection');
+    || selectedChecks.includes('duplicate_detection')
+    || selectedChecks.includes('hit_at_k');
   const mockAutReady = Boolean(autStatus?.running && !autStatus.outdated);
 
   const invalidConfiguration = !selectedChecks.length
@@ -1205,7 +1256,7 @@ export default function ExecutionPage() {
               setDriftWorkbook(null);
             }}
           />
-          <span className="field-help">The workbook must contain a question column. Neighbor Consistency and Duplicate Detection analyze each question’s retrieved records; AUT-Vector Drift judges the AUT answer against that question’s evidence.</span>
+          <span className="field-help">The workbook must contain a question column. Hit@k also requires object_type, chunk, and object_image_paths columns. Neighbor Consistency and Duplicate Detection analyze each question’s retrieved records; AUT-Vector Drift judges the AUT answer against that question’s evidence.</span>
         </label>
         {workbook && <p className="text-xs text-slate-500">{workbook.name}</p>}
         {selectedChecks.includes('aut_vector_drift') && autStatusLoading && (
@@ -1573,12 +1624,18 @@ export default function ExecutionPage() {
             <div className="metric-card execution-summary-card execution-summary-total"><strong>{report.summary.total}</strong><span>Total checks</span></div>
           </div>
           <QuestionWiseResults report={report} selectedChecks={selectedChecks} />
+          {report.results
+            .filter((result) => result.check === 'hit_at_k')
+            .map((result, index) => (
+              <HitAtKResults key={`${result.check}-${index}`} result={result} />
+            ))}
           {report.results.some((result) => ![
             'known_similar_pairs',
             'near_duplicate_detection_by_question',
             'AUT-Vector Drift',
             'dimension_consistency_by_question',
             'metadata_completeness_by_question',
+            'hit_at_k',
           ].includes(result.check)) && (
             <div className="overflow-x-auto">
               <table className="data-table">
@@ -1590,6 +1647,7 @@ export default function ExecutionPage() {
                     'AUT-Vector Drift',
                     'dimension_consistency_by_question',
                     'metadata_completeness_by_question',
+                    'hit_at_k',
                   ].includes(result.check))
                   .map((result, index) => (
                     <tr key={`${result.check}-${index}`}>

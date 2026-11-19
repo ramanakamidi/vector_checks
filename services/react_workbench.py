@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 import uuid
@@ -17,6 +18,9 @@ _lock = threading.RLock()
 _sessions: dict[str, dict[str, Any]] = {}
 _analysis_progress_lock = threading.Lock()
 _analysis_progress: dict[str, dict[str, Any]] = {}
+_qa_generation_progress_lock = threading.Lock()
+_qa_generation_progress: dict[str, dict[str, Any]] = {}
+_logger = logging.getLogger(__name__)
 _output_root = PROJECT_ROOT / "ui" / "workbench_output" / "react_sessions"
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_PDF_COUNT = 10
@@ -62,6 +66,94 @@ def _update_analysis_progress(
 
 def fail_analysis_job(job_id: str, message: str) -> None:
     _update_analysis_progress(job_id, 0, message, "failed")
+
+
+def create_qa_generation_job() -> dict[str, Any]:
+    job_id = uuid.uuid4().hex
+    progress = {
+        "job_id": job_id,
+        "status": "running",
+        "progress": 0,
+        "completed": 0,
+        "total": 0,
+        "message": "Preparing Q&A generation...",
+    }
+    with _qa_generation_progress_lock:
+        _qa_generation_progress[job_id] = progress
+    return dict(progress)
+
+
+def get_qa_generation_progress(job_id: str) -> dict[str, Any]:
+    with _qa_generation_progress_lock:
+        progress = _qa_generation_progress.get(job_id)
+        if progress is None:
+            raise KeyError(f"Q&A generation job '{job_id}' was not found.")
+        return dict(progress)
+
+
+def _update_qa_generation_progress(
+    job_id: str,
+    completed: int,
+    total: int,
+    message: str,
+    status: str = "running",
+) -> None:
+    if status == "complete":
+        progress = 100
+    elif status == "finalizing":
+        progress = 95
+    else:
+        progress = min(90, round(completed * 90 / total)) if total else 0
+    with _qa_generation_progress_lock:
+        if job_id in _qa_generation_progress:
+            _qa_generation_progress[job_id].update({
+                "status": status,
+                "progress": progress,
+                "completed": completed,
+                "total": total,
+                "message": message,
+            })
+
+
+def run_qa_generation_job(
+    job_id: str,
+    session_id: str,
+    config: dict[str, Any],
+) -> None:
+    try:
+        result = generate_qa(
+            session_id,
+            **config,
+            progress_callback=lambda completed, total, message, status="running": (
+                _update_qa_generation_progress(
+                    job_id,
+                    completed,
+                    total,
+                    message,
+                    status,
+                )
+            ),
+        )
+    except Exception as exc:
+        _logger.exception("Q&A generation job %s failed", job_id)
+        current = get_qa_generation_progress(job_id)
+        _update_qa_generation_progress(
+            job_id,
+            current["completed"],
+            current["total"],
+            str(exc),
+            "failed",
+        )
+    else:
+        total_pairs = len(result["qa_records"])
+        current = get_qa_generation_progress(job_id)
+        _update_qa_generation_progress(
+            job_id,
+            current["completed"],
+            current["total"],
+            f"Generated {total_pairs} question-and-answer pairs.",
+            "complete",
+        )
 
 
 def _chunk_documents(
@@ -330,6 +422,11 @@ def generate_qa(
     object_question_count: int,
     text_question_count: int,
     credentials: dict[str, str],
+    generate_single_chunk: bool = True,
+    generate_multi_hop: bool = False,
+    multi_hop_chunk_count: int = 2,
+    multi_hop_question_count: int = 2,
+    progress_callback=None,
 ) -> dict[str, Any]:
     with _lock:
         state = _get_state(session_id)
@@ -347,11 +444,47 @@ def generate_qa(
             raise ValueError("Select at least one object for object Q&A.")
         if generate_text and not state["text_chunks"]:
             raise ValueError("There are no text chunks to generate Q&A from.")
+        if generate_text and not (generate_single_chunk or generate_multi_hop):
+            raise ValueError("Select single-chunk Q&A, multi-hop Q&A, or both.")
         if generate_text and not state.get(
             "text_enabled",
             bool(state.get("documents") or state.get("text_chunks")),
         ):
             raise ValueError("Text was not selected for this analysis.")
+        if generate_text and generate_single_chunk and not 1 <= text_question_count <= 3:
+            raise ValueError("Text Q&A generation supports 1 to 3 questions per chunk.")
+        if generate_text and generate_multi_hop:
+            if not 1 <= multi_hop_question_count <= 3:
+                raise ValueError("Multi-hop Q&A generation supports 1 to 3 questions per group.")
+            if not 2 <= multi_hop_chunk_count <= 10:
+                raise ValueError("Multi-hop Q&A requires 2 to 10 adjacent chunks per group.")
+
+        text_chunks = state["text_chunks"] if generate_text else []
+        single_chunk_count = len(text_chunks) if generate_single_chunk else 0
+        multi_hop_groups = (
+            custom_logic.get_adjacent_text_chunk_groups(
+                text_chunks,
+                multi_hop_chunk_count,
+            )
+            if generate_multi_hop and generate_text
+            else []
+        )
+        if generate_multi_hop and generate_text and not multi_hop_groups:
+            raise ValueError(
+                f"No groups of {multi_hop_chunk_count} adjacent text chunks were found within one PDF."
+            )
+        object_count = len(object_ids) if generate_objects else 0
+        total_steps = object_count + single_chunk_count + len(multi_hop_groups)
+
+        def report_progress(
+            completed: int,
+            message: str,
+            status: str = "running",
+        ) -> None:
+            if progress_callback:
+                progress_callback(completed, total_steps, message, status)
+
+        report_progress(0, "Starting Q&A generation...")
 
         custom_logic.configure_azure_openai(
             credentials["api_key"],
@@ -360,16 +493,63 @@ def generate_qa(
             credentials["api_version"],
         )
         if generate_objects:
-            for object_id in object_ids:
+            for index, object_id in enumerate(object_ids, start=1):
+                report_progress(
+                    index - 1,
+                    f"Generating object Q&A: {index} of {object_count}",
+                )
                 generated = custom_logic.generate_qa_for_record(
                     objects_by_id[object_id], object_question_count
                 )
                 state["qa_by_object"][object_id] = generated.get("pairs", [])
+                report_progress(
+                    index,
+                    f"Completed object Q&A: {index} of {object_count}",
+                )
+        completed_before_text = object_count
         if generate_text:
-            state["text_qa"] = custom_logic.generate_qa_for_text_chunks(
-                state["text_chunks"], text_question_count
-            )
+            single_chunk_qa = []
+            multi_hop_qa = []
+            if generate_multi_hop:
+                report_progress(
+                    completed_before_text,
+                    f"Preparing multi-hop Q&A: 0 of {len(multi_hop_groups)} groups",
+                )
+                multi_hop_qa = custom_logic.generate_qa_for_adjacent_text_chunks(
+                    state["text_chunks"],
+                    multi_hop_chunk_count,
+                    multi_hop_question_count,
+                    progress_callback=lambda current, total: report_progress(
+                        completed_before_text + current,
+                        f"Generating multi-hop Q&A: {current} of {total} groups complete",
+                    ),
+                )
+            if generate_single_chunk:
+                single_chunk_offset = completed_before_text + len(multi_hop_groups)
+                report_progress(
+                    single_chunk_offset,
+                    f"Preparing single-chunk Q&A: 0 of {single_chunk_count} chunks",
+                )
+                single_chunk_qa = custom_logic.generate_qa_for_text_chunks(
+                    state["text_chunks"],
+                    text_question_count,
+                    progress_callback=lambda current, total: report_progress(
+                        single_chunk_offset + current,
+                        f"Generating single-chunk Q&A: {current} of {total} chunks complete",
+                    ),
+                )
+            state["text_qa"] = single_chunk_qa + multi_hop_qa
+        report_progress(
+            total_steps,
+            "Saving generated Q&A to this session...",
+            "finalizing",
+        )
         _save_session(session_id, state)
+        report_progress(
+            total_steps,
+            "Preparing generated Q&A results...",
+            "finalizing",
+        )
         return _public_session(session_id, state)
 
 

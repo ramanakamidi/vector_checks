@@ -6,6 +6,7 @@ from typing import Any
 
 from checks import (
     duplicate_detection,
+    hit_at_k,
     metadata_completeness,
     negative_queries,
     neighbor_consistency,
@@ -20,6 +21,7 @@ CHECK_CATEGORIES = {
     "duplicate_detection",
     "metadata_completeness",
     "negative_query_similarity",
+    "hit_at_k",
 }
 
 DEFAULT_REQUIRED_FIELDS = duplicate_detection.DEFAULT_METADATA_FIELDS
@@ -107,6 +109,7 @@ def run_project_checks(
     negative_query_max_similarity: float = negative_queries.DEFAULT_MAX_SIMILARITY,
     workbook_questions: list[str] | None = None,
     question_retrieval_top_k: int = 5,
+    hit_at_k_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     unknown_checks = set(selected_checks) - CHECK_CATEGORIES
     if unknown_checks:
@@ -123,9 +126,13 @@ def run_project_checks(
         raise ValueError(
             "The maximum negative-query cosine similarity must be between 0 and 1."
         )
+    if "hit_at_k" in selected_checks and not hit_at_k_rows:
+        raise ValueError("Hit@k requires a workbook with per-question target data.")
 
     connector = _connect_project(project_id, persist_directory)
     results: list[dict[str, Any]] = []
+    if "hit_at_k" in selected_checks:
+        results.append(hit_at_k.evaluate_hit_at_k(connector, hit_at_k_rows or []))
     question_retrievals = None
     if workbook_questions and set(selected_checks).intersection(
         {"neighbor_consistency", "duplicate_detection"}

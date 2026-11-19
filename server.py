@@ -37,7 +37,16 @@ from pathlib import Path
 # Ensure the project root is importable regardless of cwd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fastapi import FastAPI, HTTPException, Query, Body, UploadFile, File, Form
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    HTTPException,
+    Query,
+    Body,
+    UploadFile,
+    File,
+    Form,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, SecretStr, ValidationError
@@ -131,8 +140,12 @@ class WorkbenchQARequest(BaseModel):
     object_ids: List[str] = Field(default_factory=list)
     generate_objects: bool = True
     generate_text: bool = True
+    generate_single_chunk: bool = True
+    generate_multi_hop: bool = False
     object_question_count: int = Field(default=5, ge=1, le=20)
     text_question_count: int = Field(default=2, ge=1, le=3)
+    multi_hop_chunk_count: int = Field(default=2, ge=2, le=10)
+    multi_hop_question_count: int = Field(default=2, ge=1, le=3)
     api_key: SecretStr
     endpoint: str
     deployment: str
@@ -1615,6 +1628,48 @@ async def get_workbench_session(session_id: str):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@app.post("/api/workbench/{session_id}/qa-jobs")
+async def create_workbench_qa_generation_job(
+    session_id: str,
+    background_tasks: BackgroundTasks,
+    req: WorkbenchQARequest,
+):
+    credentials = {
+        "api_key": req.api_key.get_secret_value(),
+        "endpoint": req.endpoint,
+        "deployment": req.deployment,
+        "api_version": req.api_version,
+    }
+    config = {
+        "object_ids": req.object_ids,
+        "generate_objects": req.generate_objects,
+        "generate_text": req.generate_text,
+        "object_question_count": req.object_question_count,
+        "text_question_count": req.text_question_count,
+        "credentials": credentials,
+        "generate_single_chunk": req.generate_single_chunk,
+        "generate_multi_hop": req.generate_multi_hop,
+        "multi_hop_chunk_count": req.multi_hop_chunk_count,
+        "multi_hop_question_count": req.multi_hop_question_count,
+    }
+    job = react_workbench.create_qa_generation_job()
+    background_tasks.add_task(
+        react_workbench.run_qa_generation_job,
+        job["job_id"],
+        session_id,
+        config,
+    )
+    return job
+
+
+@app.get("/api/workbench/qa-jobs/{job_id}")
+async def get_workbench_qa_generation_progress(job_id: str):
+    try:
+        return react_workbench.get_qa_generation_progress(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @app.put("/api/workbench/{session_id}/chunking")
 async def update_workbench_chunking(
     session_id: str,
@@ -1655,6 +1710,10 @@ async def generate_workbench_qa(
             req.object_question_count,
             req.text_question_count,
             credentials,
+            req.generate_single_chunk,
+            req.generate_multi_hop,
+            req.multi_hop_chunk_count,
+            req.multi_hop_question_count,
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -1746,11 +1805,12 @@ async def review_expected_answers(
 @app.post("/api/projects/{project_id}/ingest-pdfs")
 async def ingest_project_pdfs(
     project_id: str,
+    background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
     job_id: str = Form(""),
     chunking_json: str = Form(""),
 ):
-    """Extract and embed PDF figures, prose, and tables."""
+    """Queue PDF extraction and embedding; poll the job progress endpoint for results."""
     try:
         chunking = WorkbenchChunkingRequest.model_validate_json(
             chunking_json or "{}"
@@ -1781,8 +1841,6 @@ async def ingest_project_pdfs(
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found.")
 
-    outcomes = []
-    errors = []
     resolved_job_id = job_id or uuid.uuid4().hex
     started_at = time.time()
     with PDF_INGESTION_JOBS_LOCK:
@@ -1820,69 +1878,15 @@ async def ingest_project_pdfs(
             "elapsed_seconds": 0,
             "started_at": started_at,
         }
-    file_index = 0
-    for uploaded in files:
-        file_index += 1
-        filename = os.path.basename(uploaded.filename or "upload.pdf")
-        def update_progress(
-            progress: int,
-            phase: str,
-            message: str,
-            **details: Any,
-        ) -> None:
-            overall = int(
-                ((file_index - 1) / max(1, len(files))) * 100
-                + (progress / max(1, len(files)))
-            )
-            overall = min(99, max(0, overall))
-            with PDF_INGESTION_JOBS_LOCK:
-                job = PDF_INGESTION_JOBS.get(resolved_job_id)
-                if job is not None:
-                    job.update({
-                        "status": "running",
-                        "phase": phase,
-                        "progress": overall,
-                        "message": message,
-                        "current_file": filename,
-                        "file_index": file_index,
-                        "file_total": len(files),
-                        "elapsed_seconds": int(time.time() - started_at),
-                        **details,
-                    })
-        with PDF_INGESTION_JOBS_LOCK:
-            job = PDF_INGESTION_JOBS.get(resolved_job_id)
-            if job is not None:
-                job.update({
-                    "phase": "queued",
-                    "progress": int(((file_index - 1) / max(1, len(files))) * 100),
-                    "message": f"Starting {filename}",
-                    "current_file": filename,
-                    "file_index": file_index,
-                    "file_total": len(files),
-                })
-        content = await uploaded.read()
-        try:
-            outcome = await run_in_threadpool(
-                ingest_pdf,
-                project_id,
-                filename,
-                content,
-                update_progress,
-                chunking.model_dump(),
-            )
-            outcomes.append(outcome)
-        except (ValueError, FileNotFoundError) as exc:
-            errors.append({"pdf_name": filename, "error": str(exc)})
-        except Exception as exc:
-            traceback.print_exc()
-            errors.append({
-                "pdf_name": filename,
-                "error": f"{type(exc).__name__}: {exc}",
-            })
-        finally:
-            await uploaded.close()
-
-    if errors and not outcomes:
+    uploads: list[tuple[str, bytes]] = []
+    try:
+        for uploaded in files:
+            filename = os.path.basename(uploaded.filename or "upload.pdf")
+            try:
+                uploads.append((filename, await uploaded.read()))
+            finally:
+                await uploaded.close()
+    except Exception as exc:
         with PDF_INGESTION_JOBS_LOCK:
             job = PDF_INGESTION_JOBS.get(resolved_job_id)
             if job is not None:
@@ -1890,48 +1894,156 @@ async def ingest_project_pdfs(
                     "status": "failed",
                     "phase": "failed",
                     "progress": 100,
-                    "message": "PDF ingestion failed",
+                    "message": f"Could not receive PDF uploads: {type(exc).__name__}: {exc}",
+                    "elapsed_seconds": int(time.time() - started_at),
+                })
+        raise
+
+    background_tasks.add_task(
+        _run_pdf_ingestion_job,
+        project_id,
+        uploads,
+        resolved_job_id,
+        chunking.model_dump(),
+        started_at,
+    )
+    return {"status": "accepted", "job_id": resolved_job_id}
+
+
+async def _run_pdf_ingestion_job(
+    project_id: str,
+    uploads: list[tuple[str, bytes]],
+    job_id: str,
+    chunking: dict[str, Any],
+    started_at: float,
+) -> None:
+    outcomes: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    try:
+        for file_index, (filename, content) in enumerate(uploads, start=1):
+            def update_progress(
+                progress: int,
+                phase: str,
+                message: str,
+                **details: Any,
+            ) -> None:
+                overall = int(
+                    ((file_index - 1) / max(1, len(uploads))) * 100
+                    + (progress / max(1, len(uploads)))
+                )
+                overall = min(99, max(0, overall))
+                with PDF_INGESTION_JOBS_LOCK:
+                    job = PDF_INGESTION_JOBS.get(job_id)
+                    if job is not None:
+                        job.update({
+                            "status": "running",
+                            "phase": phase,
+                            "progress": overall,
+                            "message": message,
+                            "current_file": filename,
+                            "file_index": file_index,
+                            "file_total": len(uploads),
+                            "elapsed_seconds": int(time.time() - started_at),
+                            **details,
+                        })
+
+            with PDF_INGESTION_JOBS_LOCK:
+                job = PDF_INGESTION_JOBS.get(job_id)
+                if job is not None:
+                    job.update({
+                        "phase": "queued",
+                        "progress": int(
+                            ((file_index - 1) / max(1, len(uploads))) * 100
+                        ),
+                        "message": f"Starting {filename}",
+                        "current_file": filename,
+                        "file_index": file_index,
+                        "file_total": len(uploads),
+                    })
+            try:
+                outcome = await run_in_threadpool(
+                    ingest_pdf,
+                    project_id,
+                    filename,
+                    content,
+                    update_progress,
+                    chunking,
+                )
+                outcomes.append(outcome)
+            except (ValueError, FileNotFoundError) as exc:
+                errors.append({"pdf_name": filename, "error": str(exc)})
+            except Exception as exc:
+                traceback.print_exc()
+                errors.append({
+                    "pdf_name": filename,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+
+        if errors and not outcomes:
+            with PDF_INGESTION_JOBS_LOCK:
+                job = PDF_INGESTION_JOBS.get(job_id)
+                if job is not None:
+                    job.update({
+                        "status": "failed",
+                        "phase": "failed",
+                        "progress": 100,
+                        "message": "PDF ingestion failed",
+                        "elapsed_seconds": int(time.time() - started_at),
+                        "errors": errors,
+                    })
+            return
+
+        image_records_ingested = sum(
+            item.get("image_records_ingested", item["chunks_ingested"])
+            for item in outcomes
+        )
+        text_records_ingested = sum(
+            item.get("text_records_ingested", 0) for item in outcomes
+        )
+        table_records_ingested = sum(
+            item.get("table_records_ingested", 0) for item in outcomes
+        )
+        chunks_ingested = sum(item["chunks_ingested"] for item in outcomes)
+        result = {
+            "status": "partial" if errors else "success",
+            "job_id": job_id,
+            "files": outcomes,
+            "errors": errors,
+            "image_records_ingested": image_records_ingested,
+            "text_records_ingested": text_records_ingested,
+            "table_records_ingested": table_records_ingested,
+            "chunks_ingested": chunks_ingested,
+        }
+        with PDF_INGESTION_JOBS_LOCK:
+            job = PDF_INGESTION_JOBS.get(job_id)
+            if job is not None:
+                job.update({
+                    "status": "complete",
+                    "phase": "complete",
+                    "progress": 100,
+                    "message": "PDF ingestion completed",
+                    "elapsed_seconds": int(time.time() - started_at),
+                    "image_records_ingested": image_records_ingested,
+                    "text_records_ingested": text_records_ingested,
+                    "table_records_ingested": table_records_ingested,
+                    "chunks_ingested": chunks_ingested,
+                    "errors": errors,
+                    "result": result,
+                })
+    except Exception as exc:
+        traceback.print_exc()
+        with PDF_INGESTION_JOBS_LOCK:
+            job = PDF_INGESTION_JOBS.get(job_id)
+            if job is not None:
+                job.update({
+                    "status": "failed",
+                    "phase": "failed",
+                    "progress": 100,
+                    "message": f"PDF ingestion stopped: {type(exc).__name__}: {exc}",
                     "elapsed_seconds": int(time.time() - started_at),
                     "errors": errors,
                 })
-        raise HTTPException(status_code=422, detail={"errors": errors})
-    image_records_ingested = sum(
-        item.get("image_records_ingested", item["chunks_ingested"])
-        for item in outcomes
-    )
-    text_records_ingested = sum(
-        item.get("text_records_ingested", 0) for item in outcomes
-    )
-    table_records_ingested = sum(
-        item.get("table_records_ingested", 0) for item in outcomes
-    )
-    chunks_ingested = sum(item["chunks_ingested"] for item in outcomes)
-    result = {
-        "status": "partial" if errors else "success",
-        "job_id": resolved_job_id,
-        "files": outcomes,
-        "errors": errors,
-        "image_records_ingested": image_records_ingested,
-        "text_records_ingested": text_records_ingested,
-        "table_records_ingested": table_records_ingested,
-        "chunks_ingested": chunks_ingested,
-    }
-    with PDF_INGESTION_JOBS_LOCK:
-        job = PDF_INGESTION_JOBS.get(resolved_job_id)
-        if job is not None:
-            job.update({
-                "status": "complete",
-                "phase": "complete",
-                "progress": 100,
-                "message": "PDF ingestion completed",
-                "elapsed_seconds": int(time.time() - started_at),
-                "image_records_ingested": image_records_ingested,
-                "text_records_ingested": text_records_ingested,
-                "table_records_ingested": table_records_ingested,
-                "chunks_ingested": chunks_ingested,
-                "errors": errors,
-            })
-    return result
+        raise
 
 
 @app.get("/api/projects/{project_id}/ingestion-progress/{job_id}")
@@ -2162,6 +2274,11 @@ async def run_project_workbook_checks(
 
         workbook_questions = read_workbook_questions(workbook_bytes)
         selected_checks = list(req.selected_checks)
+        hit_at_k_rows = None
+        if "hit_at_k" in selected_checks:
+            from checks.hit_at_k import read_hit_at_k_rows
+
+            hit_at_k_rows = read_hit_at_k_rows(workbook_bytes)
         drift_selected = "aut_vector_drift" in selected_checks
         vector_checks = [check for check in selected_checks if check != "aut_vector_drift"]
         unknown_checks = set(vector_checks) - CHECK_CATEGORIES
@@ -2199,6 +2316,7 @@ async def run_project_workbook_checks(
                     "metadata_completeness",
                 }.intersection(vector_checks) else None,
                 question_retrieval_top_k=req.question_retrieval_top_k,
+                hit_at_k_rows=hit_at_k_rows,
             )
             results.extend(vector_report["results"])
 
